@@ -1,6 +1,6 @@
 heat_template_version: 2018-08-31
 
-description: Simple stack: one Nova server in existing network
+description: "Simple stack: one Nova server in existing network"
 
 parameters:
   server_name:
