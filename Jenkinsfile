@@ -22,39 +22,43 @@ pipeline {
     }
 
     stage('Create/Update stack') {
-      when { expression { params.ACTION == 'create_or_update' } }
-      steps {
-        sh """
-          set -e
-          . /home/ubuntu/students-openrc.sh
+    when { expression { params.ACTION == 'create_or_update' } }
+    steps {
+        withCredentials([string(credentialsId: 'openstack-password', variable: 'OS_PASS')]) {
+        sh(script: """
+            #!/bin/bash
+            set -e
 
-          if openstack stack show '${params.STACK_NAME}' >/dev/null 2>&1; then
+            export OS_PASSWORD="\$OS_PASS"
+            . /home/ubuntu/students-openrc.sh
+
+            if openstack stack show '${params.STACK_NAME}' >/dev/null 2>&1; then
             echo 'Stack exists -> update'
             openstack stack update -t heat/stack.yaml -e heat/env.yaml \\
-              --parameter server_name='${params.SERVER_NAME}' \\
-              --parameter net_id='${params.NET_ID}' \\
-              --parameter key_name='${params.KEY_NAME}' \\
-              --parameter security_group='${params.SECURITY_GROUP}' \\
-              '${params.STACK_NAME}'
+                --parameter server_name='${params.SERVER_NAME}' \\
+                --parameter net_id='${params.NET_ID}' \\
+                --parameter key_name='${params.KEY_NAME}' \\
+                --parameter security_group='${params.SECURITY_GROUP}' \\
+                '${params.STACK_NAME}'
             openstack stack wait '${params.STACK_NAME}'
-          else
+            else
             echo 'Creating stack'
             openstack stack create -t heat/stack.yaml -e heat/env.yaml \\
-              --parameter server_name='${params.SERVER_NAME}' \\
-              --parameter net_id='${params.NET_ID}' \\
-              --parameter key_name='${params.KEY_NAME}' \\
-              --parameter security_group='${params.SECURITY_GROUP}' \\
-              '${params.STACK_NAME}'
+                --parameter server_name='${params.SERVER_NAME}' \\
+                --parameter net_id='${params.NET_ID}' \\
+                --parameter key_name='${params.KEY_NAME}' \\
+                --parameter security_group='${params.SECURITY_GROUP}' \\
+                '${params.STACK_NAME}'
             openstack stack wait '${params.STACK_NAME}'
-          fi
+            fi
 
-          echo 'STACK STATUS:'
-          openstack stack show '${params.STACK_NAME}' -f value -c stack_status
+            echo 'STACK STATUS:'
+            openstack stack show '${params.STACK_NAME}' -f value -c stack_status
 
-          echo 'SERVER IP:'
-          openstack stack output show '${params.STACK_NAME}' server_ip -f value
-        """
-      }
+            echo 'SERVER IP:'
+            openstack stack output show '${params.STACK_NAME}' server_ip -f value
+        """, shell: '/bin/bash')
+        }
     }
 
     stage('Delete stack') {
