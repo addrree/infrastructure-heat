@@ -17,6 +17,8 @@ pipeline {
           set -e
           which openstack
           openstack --version
+          which bash
+          bash --version | head -n 1
         '''
       }
     }
@@ -25,12 +27,11 @@ pipeline {
       when { expression { params.ACTION == 'create_or_update' } }
       steps {
         withCredentials([string(credentialsId: 'openstack-password', variable: 'OS_PASS')]) {
-          sh(
-            script: """
-              #!/bin/bash
+          sh """
+            set -e
+            bash -lc '
               set -e
-
-              export OS_PASSWORD="\$OS_PASS"
+              export OS_PASSWORD="${OS_PASS}"
               . /home/ubuntu/students-openrc.sh
 
               if openstack stack show "${params.STACK_NAME}" >/dev/null 2>&1; then
@@ -58,9 +59,8 @@ pipeline {
 
               echo "SERVER IP:"
               openstack stack output show "${params.STACK_NAME}" server_ip -f value
-            """,
-            shell: '/bin/bash'
-          )
+            '
+          """
         }
       }
     }
@@ -69,19 +69,16 @@ pipeline {
       when { expression { params.ACTION == 'delete' } }
       steps {
         withCredentials([string(credentialsId: 'openstack-password', variable: 'OS_PASS')]) {
-          sh(
-            script: """
-              #!/bin/bash
+          sh """
+            set -e
+            bash -lc '
               set -e
-
-              export OS_PASSWORD="\$OS_PASS"
+              export OS_PASSWORD="${OS_PASS}"
               . /home/ubuntu/students-openrc.sh
-
               openstack stack delete -y --wait "${params.STACK_NAME}"
               echo "Deleted: ${params.STACK_NAME}"
-            """,
-            shell: '/bin/bash'
-          )
+            '
+          """
         }
       }
     }
