@@ -29,77 +29,76 @@ pipeline {
     }
 
     stage('Create/Update stack') {
-      when { expression { params.ACTION == 'create_or_update' } }
-      steps {
-        sh """
-          set -e
-          bash -lc '
-            set -e
-            . /home/ubuntu/openrc-jenkins.sh
+        steps {
+            withEnv([
+            "STACK_NAME=${params.STACK_NAME}",
+            "SERVER_NAME=${params.SERVER_NAME}",
+            "NET_ID=${params.NET_ID}",
+            "KEY_NAME=${params.KEY_NAME}",
+            "SECURITY_GROUP=${params.SECURITY_GROUP}"
+            ]) {
+            sh '''#!/usr/bin/env bash
+                set -euo pipefail
 
-            openstack token issue >/dev/null
+                source /home/ubuntu/openrc-jenkins.sh
+                openstack token issue >/dev/null
 
-            if openstack stack show "${params.STACK_NAME}" >/dev/null 2>&1; then
-              echo "Stack exists -> update"
-              openstack stack update -t heat/stack.yaml -e heat/env.yaml \\
-                --parameter server_name="${params.SERVER_NAME}" \\
-                --parameter net_id="${params.NET_ID}" \\
-                --parameter key_name="${params.KEY_NAME}" \\
-                --parameter security_group="${params.SECURITY_GROUP}" \\
-                "${params.STACK_NAME}"
-              echo "Waiting for stack to finish..."
+                if openstack stack show "$STACK_NAME" >/dev/null 2>&1; then
+                echo "Stack exists -> update"
+                openstack stack update -t heat/stack.yaml -e heat/env.yaml \
+                    --parameter server_name="$SERVER_NAME" \
+                    --parameter net_id="$NET_ID" \
+                    --parameter key_name="$KEY_NAME" \
+                    --parameter security_group="$SECURITY_GROUP" \
+                    "$STACK_NAME"
+                else
+                echo "Creating stack"
+                openstack stack create -t heat/stack.yaml -e heat/env.yaml \
+                    --parameter server_name="$SERVER_NAME" \
+                    --parameter net_id="$NET_ID" \
+                    --parameter key_name="$KEY_NAME" \
+                    --parameter security_group="$SECURITY_GROUP" \
+                    "$STACK_NAME"
+                fi
+
+                echo "Waiting for stack to finish..."
                 for i in $(seq 1 60); do
-                    status=$(openstack stack show "${params.STACK_NAME}" -f value -c stack_status)
-                    echo "Status: $status"
-                    case "$status" in
-                        *_COMPLETE) break ;;
-                        *_FAILED) echo "Stack failed"; openstack stack failures list "${params.STACK_NAME}" || true; exit 1 ;;
-                    esac
-                    sleep 10
+                status=$(openstack stack show "$STACK_NAME" -f value -c stack_status)
+                echo "Status: $status"
+                case "$status" in
+                    *_COMPLETE) break ;;
+                    *_FAILED)
+                    echo "Stack failed"
+                    openstack stack failures list "$STACK_NAME" || true
+                    exit 1
+                    ;;
+                esac
+                sleep 10
                 done
-            else
-              echo "Creating stack"
-              openstack stack create -t heat/stack.yaml -e heat/env.yaml \\
-                --parameter server_name="${params.SERVER_NAME}" \\
-                --parameter net_id="${params.NET_ID}" \\
-                --parameter key_name="${params.KEY_NAME}" \\
-                --parameter security_group="${params.SECURITY_GROUP}" \\
-                "${params.STACK_NAME}"
-              echo "Waiting for stack to finish..."
-                for i in $(seq 1 60); do
-                    status=$(openstack stack show "${params.STACK_NAME}" -f value -c stack_status)
-                    echo "Status: $status"
-                    case "$status" in
-                        *_COMPLETE) break ;;
-                        *_FAILED) echo "Stack failed"; openstack stack failures list "${params.STACK_NAME}" || true; exit 1 ;;
-                    esac
-                    sleep 10
-                done
-            fi
 
-            echo "STACK STATUS:"
-            openstack stack show "${params.STACK_NAME}" -f value -c stack_status
+                echo "STACK STATUS:"
+                openstack stack show "$STACK_NAME" -f value -c stack_status
 
-            echo "SERVER IP:"
-            openstack stack output show "${params.STACK_NAME}" server_ip -f value
-          '
-        """
-      }
+                echo "SERVER IP:"
+                openstack stack output show "$STACK_NAME" server_ip -f value
+            '''
+            }
+        }
     }
 
-    stage('Delete stack') {
-      when { expression { params.ACTION == 'delete' } }
-      steps {
-        sh """
-          set -e
-          bash -lc '
+        stage('Delete stack') {
+        when { expression { params.ACTION == 'delete' } }
+        steps {
+            sh """
             set -e
-            . /home/ubuntu/openrc-jenkins.sh
-            openstack stack delete -y --wait "${params.STACK_NAME}"
-            echo "Deleted: ${params.STACK_NAME}"
-          '
-        """
-      }
+            bash -lc '
+                set -e
+                . /home/ubuntu/openrc-jenkins.sh
+                openstack stack delete -y --wait "${params.STACK_NAME}"
+                echo "Deleted: ${params.STACK_NAME}"
+            '
+            """
+        }
     }
   }
 
