@@ -1,5 +1,5 @@
 pipeline {
-  agent { label 'tool' }  // чтобы выполнялось на твоём Jenkins Node
+  agent { label 'tool' }
 
   parameters {
     choice(name: 'ACTION', choices: ['create_or_update', 'delete'], description: 'Что сделать со stack')
@@ -26,8 +26,7 @@ pipeline {
       steps {
         sh """
           set -e
-          # openrc НЕ храним в Git. Он должен лежать на агенте.
-          source /home/ubuntu/students-openrc.sh
+          . /home/ubuntu/students-openrc.sh
 
           if openstack stack show '${params.STACK_NAME}' >/dev/null 2>&1; then
             echo 'Stack exists -> update'
@@ -63,7 +62,7 @@ pipeline {
       steps {
         sh """
           set -e
-          source /home/ubuntu/students-openrc.sh
+          . /home/ubuntu/students-openrc.sh
           openstack stack delete -y --wait '${params.STACK_NAME}'
           echo 'Deleted'
         """
