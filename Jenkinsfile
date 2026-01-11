@@ -22,6 +22,7 @@ pipeline {
           set -e
           which openstack
           openstack --version
+          python3 --version
         '''
       }
     }
@@ -40,8 +41,6 @@ pipeline {
             set -euo pipefail
 
             source /home/ubuntu/openrc-jenkins.sh
-
-            echo "==> Auth check"
             openstack token issue >/dev/null
 
             echo "==> Params"
@@ -51,7 +50,7 @@ pipeline {
             echo "KEY_NAME=$KEY_NAME"
             echo "SECURITY_GROUP=$SECURITY_GROUP"
 
-            echo "==> Try UPDATE first"
+            echo "==> Try UPDATE first (idempotent)"
             set +e
             openstack stack update -t heat/stack.yaml -e heat/env.yaml \
               --parameter server_name="$SERVER_NAME" \
@@ -74,51 +73,67 @@ pipeline {
               echo "==> Update requested"
             fi
 
-            echo "==> Initial stack show"
-            openstack stack show "$STACK_NAME" || true
-
             echo "==> Waiting for stack to finish..."
             for i in $(seq 1 90); do
               echo "---- poll #$i ----"
-              # берём статус и НЕ глушим ошибки: выводим что вернуло
-              out=$(openstack stack show "$STACK_NAME" -f value -c stack_status 2>&1) || true
-              echo "STACK_SHOW_OUT: $out"
 
-              # если это ошибка, out будет содержать текст ошибки
-              case "$out" in
-                *"_IN_PROGRESS"*)
+              # JSON почти всегда поддерживается, вытаскиваем stack_status через python
+              json=$(openstack stack show "$STACK_NAME" -f json 2>&1) || true
+
+              # если пришла ошибка, json будет текстом ошибки — покажем и попробуем дальше
+              if echo "$json" | grep -qiE 'error|not found|unauthorized|invalid'; then
+                echo "STACK_SHOW_ERROR_OR_TEXT: $json"
+                echo "Recent events (if available):"
+                openstack stack event list "$STACK_NAME" | tail -n 15 || true
+                sleep 5
+                continue
+              fi
+
+              status=$(python3 - <<'PY'
+import json,sys
+data=json.loads(sys.stdin.read())
+print(data.get("stack_status",""))
+PY
+<<< "$json")
+
+              echo "Status: $status"
+
+              case "$status" in
+                *_IN_PROGRESS)
                   sleep 10
                   ;;
-                *"_COMPLETE"*)
-                  echo "==> Complete"
+                *_COMPLETE)
+                  echo "==> COMPLETE"
                   break
                   ;;
-                *"_FAILED"*)
+                *_FAILED)
                   echo "==> FAILED"
                   openstack stack show "$STACK_NAME" || true
                   echo "==> Recent events:"
-                  openstack stack event list "$STACK_NAME" | tail -n 30 || true
+                  openstack stack event list "$STACK_NAME" | tail -n 50 || true
                   echo "==> Failures:"
                   openstack stack failures list "$STACK_NAME" || true
                   exit 1
                   ;;
+                "")
+                  echo "Empty status (unexpected). Printing stack show text:"
+                  echo "$json"
+                  sleep 5
+                  ;;
                 *)
-                  # не похоже на статус: значит пришла ошибка/пусто. Покажем детали и попробуем ещё.
-                  echo "==> Unexpected status output, printing stack show and events..."
+                  echo "Unexpected status: $status"
                   openstack stack show "$STACK_NAME" || true
-                  openstack stack event list "$STACK_NAME" | tail -n 10 || true
+                  openstack stack event list "$STACK_NAME" | tail -n 20 || true
                   sleep 5
                   ;;
               esac
             done
 
-            echo "==> Final status"
-            openstack stack show "$STACK_NAME" -f value -c stack_status
+            echo "==> Final stack show"
+            openstack stack show "$STACK_NAME" || true
 
             echo "==> Outputs"
             openstack stack output list "$STACK_NAME" || true
-            echo "SERVER IP:"
-            openstack stack output show "$STACK_NAME" server_ip -f value
           '''
         }
       }
@@ -134,7 +149,7 @@ pipeline {
             source /home/ubuntu/openrc-jenkins.sh
             openstack token issue >/dev/null
 
-            echo "==> Deleting stack: $STACK_NAME"
+            echo "Deleting stack: $STACK_NAME"
             openstack stack delete -y "$STACK_NAME" || true
 
             echo "==> Waiting for delete..."
