@@ -47,7 +47,16 @@ pipeline {
                 --parameter key_name="${params.KEY_NAME}" \\
                 --parameter security_group="${params.SECURITY_GROUP}" \\
                 "${params.STACK_NAME}"
-              openstack stack wait "${params.STACK_NAME}"
+              echo "Waiting for stack to finish..."
+                for i in $(seq 1 60); do
+                    status=$(openstack stack show "${params.STACK_NAME}" -f value -c stack_status)
+                    echo "Status: $status"
+                    case "$status" in
+                        *_COMPLETE) break ;;
+                        *_FAILED) echo "Stack failed"; openstack stack failures list "${params.STACK_NAME}" || true; exit 1 ;;
+                    esac
+                    sleep 10
+                done
             else
               echo "Creating stack"
               openstack stack create -t heat/stack.yaml -e heat/env.yaml \\
@@ -56,7 +65,16 @@ pipeline {
                 --parameter key_name="${params.KEY_NAME}" \\
                 --parameter security_group="${params.SECURITY_GROUP}" \\
                 "${params.STACK_NAME}"
-              openstack stack wait "${params.STACK_NAME}"
+              echo "Waiting for stack to finish..."
+                for i in $(seq 1 60); do
+                    status=$(openstack stack show "${params.STACK_NAME}" -f value -c stack_status)
+                    echo "Status: $status"
+                    case "$status" in
+                        *_COMPLETE) break ;;
+                        *_FAILED) echo "Stack failed"; openstack stack failures list "${params.STACK_NAME}" || true; exit 1 ;;
+                    esac
+                    sleep 10
+                done
             fi
 
             echo "STACK STATUS:"
