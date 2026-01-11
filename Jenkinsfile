@@ -13,9 +13,7 @@ pipeline {
   stages {
 
     stage('Checkout') {
-      steps {
-        checkout scm
-      }
+      steps { checkout scm }
     }
 
     stage('Check tools') {
@@ -42,50 +40,83 @@ pipeline {
             set -euo pipefail
 
             source /home/ubuntu/openrc-jenkins.sh
+
+            echo "==> Auth check"
             openstack token issue >/dev/null
 
-            echo "==> STACK_NAME=$STACK_NAME"
-            echo "==> SERVER_NAME=$SERVER_NAME"
-            echo "==> NET_ID=$NET_ID"
-            echo "==> KEY_NAME=$KEY_NAME"
-            echo "==> SECURITY_GROUP=$SECURITY_GROUP"
+            echo "==> Params"
+            echo "STACK_NAME=$STACK_NAME"
+            echo "SERVER_NAME=$SERVER_NAME"
+            echo "NET_ID=$NET_ID"
+            echo "KEY_NAME=$KEY_NAME"
+            echo "SECURITY_GROUP=$SECURITY_GROUP"
 
-            echo "==> Try update first (idempotent)"
-            if openstack stack update -t heat/stack.yaml -e heat/env.yaml \
+            echo "==> Try UPDATE first"
+            set +e
+            openstack stack update -t heat/stack.yaml -e heat/env.yaml \
               --parameter server_name="$SERVER_NAME" \
               --parameter net_id="$NET_ID" \
               --parameter key_name="$KEY_NAME" \
               --parameter security_group="$SECURITY_GROUP" \
-              "$STACK_NAME" >/dev/null 2>&1; then
-              echo "Update requested"
-            else
-              echo "Update failed -> try create (likely stack not found)"
+              "$STACK_NAME"
+            rc=$?
+            set -e
+
+            if [ $rc -ne 0 ]; then
+              echo "==> Update failed (rc=$rc) -> try CREATE"
               openstack stack create -t heat/stack.yaml -e heat/env.yaml \
                 --parameter server_name="$SERVER_NAME" \
                 --parameter net_id="$NET_ID" \
                 --parameter key_name="$KEY_NAME" \
                 --parameter security_group="$SECURITY_GROUP" \
                 "$STACK_NAME"
+            else
+              echo "==> Update requested"
             fi
 
+            echo "==> Initial stack show"
+            openstack stack show "$STACK_NAME" || true
+
             echo "==> Waiting for stack to finish..."
-            for i in $(seq 1 60); do
-              status=$(openstack stack show "$STACK_NAME" -f value -c stack_status 2>/dev/null || true)
-              echo "Status: $status"
-              case "$status" in
-                *_COMPLETE) break ;;
-                *_FAILED)
-                  echo "Stack failed"
+            for i in $(seq 1 90); do
+              echo "---- poll #$i ----"
+              # берём статус и НЕ глушим ошибки: выводим что вернуло
+              out=$(openstack stack show "$STACK_NAME" -f value -c stack_status 2>&1) || true
+              echo "STACK_SHOW_OUT: $out"
+
+              # если это ошибка, out будет содержать текст ошибки
+              case "$out" in
+                *"_IN_PROGRESS"*)
+                  sleep 10
+                  ;;
+                *"_COMPLETE"*)
+                  echo "==> Complete"
+                  break
+                  ;;
+                *"_FAILED"*)
+                  echo "==> FAILED"
+                  openstack stack show "$STACK_NAME" || true
+                  echo "==> Recent events:"
+                  openstack stack event list "$STACK_NAME" | tail -n 30 || true
+                  echo "==> Failures:"
                   openstack stack failures list "$STACK_NAME" || true
                   exit 1
                   ;;
+                *)
+                  # не похоже на статус: значит пришла ошибка/пусто. Покажем детали и попробуем ещё.
+                  echo "==> Unexpected status output, printing stack show and events..."
+                  openstack stack show "$STACK_NAME" || true
+                  openstack stack event list "$STACK_NAME" | tail -n 10 || true
+                  sleep 5
+                  ;;
               esac
-              sleep 10
             done
 
-            echo "STACK STATUS:"
+            echo "==> Final status"
             openstack stack show "$STACK_NAME" -f value -c stack_status
 
+            echo "==> Outputs"
+            openstack stack output list "$STACK_NAME" || true
             echo "SERVER IP:"
             openstack stack output show "$STACK_NAME" server_ip -f value
           '''
@@ -103,13 +134,13 @@ pipeline {
             source /home/ubuntu/openrc-jenkins.sh
             openstack token issue >/dev/null
 
-            echo "Deleting stack: $STACK_NAME"
+            echo "==> Deleting stack: $STACK_NAME"
             openstack stack delete -y "$STACK_NAME" || true
 
             echo "==> Waiting for delete..."
-            for i in $(seq 1 60); do
+            for i in $(seq 1 90); do
               if openstack stack show "$STACK_NAME" >/dev/null 2>&1; then
-                echo "Still exists, sleep 5s"
+                echo "Still exists (poll #$i), sleep 5s"
                 sleep 5
               else
                 echo "Deleted: $STACK_NAME"
