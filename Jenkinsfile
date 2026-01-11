@@ -37,10 +37,10 @@ pipeline {
           "KEY_NAME=${params.KEY_NAME}",
           "SECURITY_GROUP=${params.SECURITY_GROUP}"
         ]) {
-          sh '''#!/usr/bin/env bash
-            set -euo pipefail
+          sh '''
+            set -eu
 
-            source /home/ubuntu/openrc-jenkins.sh
+            . /home/ubuntu/openrc-jenkins.sh
             openstack token issue >/dev/null
 
             echo "==> Params"
@@ -50,83 +50,67 @@ pipeline {
             echo "KEY_NAME=$KEY_NAME"
             echo "SECURITY_GROUP=$SECURITY_GROUP"
 
-            echo "==> Try UPDATE first (idempotent)"
-            set +e
-            openstack stack update -t heat/stack.yaml -e heat/env.yaml \
+            echo "==> Try UPDATE first"
+            if openstack stack update -t heat/stack.yaml -e heat/env.yaml \
               --parameter server_name="$SERVER_NAME" \
               --parameter net_id="$NET_ID" \
               --parameter key_name="$KEY_NAME" \
               --parameter security_group="$SECURITY_GROUP" \
-              "$STACK_NAME"
-            rc=$?
-            set -e
-
-            if [ $rc -ne 0 ]; then
-              echo "==> Update failed (rc=$rc) -> try CREATE"
+              "$STACK_NAME" >/dev/null 2>&1; then
+              echo "Update requested"
+            else
+              echo "Update failed -> try CREATE"
               openstack stack create -t heat/stack.yaml -e heat/env.yaml \
                 --parameter server_name="$SERVER_NAME" \
                 --parameter net_id="$NET_ID" \
                 --parameter key_name="$KEY_NAME" \
                 --parameter security_group="$SECURITY_GROUP" \
                 "$STACK_NAME"
-            else
-              echo "==> Update requested"
             fi
 
-            echo "==> Waiting for stack to finish..."
-            for i in $(seq 1 90); do
+            echo "==> Waiting for stack..."
+            i=1
+            while [ "$i" -le 90 ]; do
               echo "---- poll #$i ----"
 
-              # JSON почти всегда поддерживается, вытаскиваем stack_status через python
-              json=$(openstack stack show "$STACK_NAME" -f json 2>&1) || true
+              # Пишем JSON в файл (без here-string)
+              if openstack stack show "$STACK_NAME" -f json > stack.json 2> stack.err; then
+                status=$(python3 -c "import json; print(json.load(open('stack.json')).get('stack_status',''))" || true)
+                echo "Status: $status"
 
-              # если пришла ошибка, json будет текстом ошибки — покажем и попробуем дальше
-              if echo "$json" | grep -qiE 'error|not found|unauthorized|invalid'; then
-                echo "STACK_SHOW_ERROR_OR_TEXT: $json"
-                echo "Recent events (if available):"
+                case "$status" in
+                  *_IN_PROGRESS)
+                    sleep 10
+                    ;;
+                  *_COMPLETE)
+                    echo "==> COMPLETE"
+                    break
+                    ;;
+                  *_FAILED)
+                    echo "==> FAILED"
+                    openstack stack show "$STACK_NAME" || true
+                    echo "==> Recent events:"
+                    openstack stack event list "$STACK_NAME" | tail -n 50 || true
+                    echo "==> Failures:"
+                    openstack stack failures list "$STACK_NAME" || true
+                    exit 1
+                    ;;
+                  *)
+                    echo "Unexpected status: $status"
+                    openstack stack show "$STACK_NAME" || true
+                    openstack stack event list "$STACK_NAME" | tail -n 20 || true
+                    sleep 5
+                    ;;
+                esac
+              else
+                echo "STACK SHOW ERROR:"
+                cat stack.err || true
+                echo "Recent events:"
                 openstack stack event list "$STACK_NAME" | tail -n 15 || true
                 sleep 5
-                continue
               fi
 
-              status=$(python3 - <<'PY'
-import json,sys
-data=json.loads(sys.stdin.read())
-print(data.get("stack_status",""))
-PY
-<<< "$json")
-
-              echo "Status: $status"
-
-              case "$status" in
-                *_IN_PROGRESS)
-                  sleep 10
-                  ;;
-                *_COMPLETE)
-                  echo "==> COMPLETE"
-                  break
-                  ;;
-                *_FAILED)
-                  echo "==> FAILED"
-                  openstack stack show "$STACK_NAME" || true
-                  echo "==> Recent events:"
-                  openstack stack event list "$STACK_NAME" | tail -n 50 || true
-                  echo "==> Failures:"
-                  openstack stack failures list "$STACK_NAME" || true
-                  exit 1
-                  ;;
-                "")
-                  echo "Empty status (unexpected). Printing stack show text:"
-                  echo "$json"
-                  sleep 5
-                  ;;
-                *)
-                  echo "Unexpected status: $status"
-                  openstack stack show "$STACK_NAME" || true
-                  openstack stack event list "$STACK_NAME" | tail -n 20 || true
-                  sleep 5
-                  ;;
-              esac
+              i=$((i+1))
             done
 
             echo "==> Final stack show"
@@ -143,17 +127,18 @@ PY
       when { expression { params.ACTION == 'delete' } }
       steps {
         withEnv(["STACK_NAME=${params.STACK_NAME}"]) {
-          sh '''#!/usr/bin/env bash
-            set -euo pipefail
+          sh '''
+            set -eu
 
-            source /home/ubuntu/openrc-jenkins.sh
+            . /home/ubuntu/openrc-jenkins.sh
             openstack token issue >/dev/null
 
             echo "Deleting stack: $STACK_NAME"
             openstack stack delete -y "$STACK_NAME" || true
 
             echo "==> Waiting for delete..."
-            for i in $(seq 1 90); do
+            i=1
+            while [ "$i" -le 90 ]; do
               if openstack stack show "$STACK_NAME" >/dev/null 2>&1; then
                 echo "Still exists (poll #$i), sleep 5s"
                 sleep 5
@@ -161,6 +146,7 @@ PY
                 echo "Deleted: $STACK_NAME"
                 exit 0
               fi
+              i=$((i+1))
             done
 
             echo "Delete timeout"
