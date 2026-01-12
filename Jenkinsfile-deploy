@@ -1,0 +1,61 @@
+pipeline {
+  agent { label 'tool' }
+
+  parameters {
+    string(name: 'BUILD_JOB', defaultValue: 'Andreyjob2', description: 'Имя job, который собирает jar')
+    string(name: 'STACK_NAME', defaultValue: 'andrey-heat-stack', description: 'Heat stack name')
+  }
+
+  stages {
+    stage('Get artifact from Build job') {
+      steps {
+        // Забираем target/*.jar из последней успешной сборки Л2
+        copyArtifacts(
+          projectName: params.BUILD_JOB,
+          selector: lastSuccessful(),
+          filter: 'target/*.jar',
+          fingerprintArtifacts: true
+        )
+        sh 'ls -la target/*.jar'
+      }
+    }
+
+    stage('Get VM IP from Heat') {
+      steps {
+        sh '''
+          set -euo pipefail
+          . /home/ubuntu/openrc-jenkins.sh
+          VM_IP="$(openstack stack output show "${STACK_NAME}" server_ip -f value | tail -n 1)"
+          echo "VM_IP=$VM_IP" | tee vm_ip.env
+        '''
+        script {
+          def props = readProperties file: 'vm_ip.env'
+          env.VM_IP = props['VM_IP']
+        }
+      }
+    }
+
+    stage('Deploy + restart') {
+      steps {
+        sshagent(credentials: ['andreyil-ssh']) {
+          sh '''
+            set -euo pipefail
+            JAR="$(ls -1 target/*.jar | head -n 1)"
+            echo "Deploy $JAR -> $VM_IP"
+
+            scp -o StrictHostKeyChecking=no "$JAR" "ubuntu@$VM_IP:/home/ubuntu/my-java-app.jar"
+
+            ssh -o StrictHostKeyChecking=no "ubuntu@$VM_IP" '
+              set -e
+              sudo mkdir -p /opt/my-java-app
+              sudo mv /home/ubuntu/my-java-app.jar /opt/my-java-app/my-java-app.jar
+              sudo chown ubuntu:ubuntu /opt/my-java-app/my-java-app.jar
+              sudo systemctl restart my-java-app
+              sudo systemctl --no-pager --full status my-java-app | head -n 30
+            '
+          '''
+        }
+      }
+    }
+  }
+}
