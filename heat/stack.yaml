@@ -13,7 +13,7 @@ parameters:
 
   flavor:
     type: string
-    default: m1.tiny
+    default: m1.small
 
   net_id:
     type: string
