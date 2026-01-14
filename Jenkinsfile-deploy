@@ -22,7 +22,7 @@ pipeline {
 
     stage('Get VM IP from Heat') {
       steps {
-        sh '''
+        sh '''#!/bin/bash
           set -euo pipefail
           . /home/ubuntu/openrc-jenkins.sh
           VM_IP="$(openstack stack output show "${STACK_NAME}" server_ip -f value | tail -n 1)"
@@ -38,7 +38,7 @@ pipeline {
     stage('Deploy + restart') {
       steps {
         sshagent(credentials: ['andreyil-ssh']) {
-          sh '''
+          sh '''#!/bin/bash
             set -euo pipefail
             JAR="$(ls -1 target/*.jar | head -n 1)"
             echo "Deploy $JAR -> $VM_IP"
