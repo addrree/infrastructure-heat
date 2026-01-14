@@ -7,19 +7,15 @@ pipeline {
   }
 
   parameters {
-    string(name: 'BUILD_JOB', defaultValue: 'AndreyLAb2', description: 'Job ЛАБ2 с артефактом artifact-restoringvalues.tgz')
-    string(name: 'BUILD_NUMBER', defaultValue: 'lastSuccessfulBuild', description: 'Номер сборки или lastSuccessfulBuild')
-    string(name: 'VM_IP', defaultValue: '192.168.199.173', description: 'IP VM для деплоя')
-    string(name: 'SSH_CRED_ID', defaultValue: 'ubuntu-agent-ssh', description: 'CredentialsId (SSH Username with private key)')
-    string(name: 'DEPLOY_DIR', defaultValue: '/opt/restoringvalues', description: 'Каталог деплоя на VM')
-    choice(name: 'DASH_MODE', choices: ['prod', 'test'], description: 'prod=8051, test=8050')
+    choice(name: 'DASH_MODE', choices: ['prod', 'test'], description: 'prod => 8051, test => 8050')
   }
 
   environment {
-    ARTIFACT = 'artifact-restoringvalues.tgz'
-    VM_IP    = "${params.VM_IP}"
-    DEPLOY_DIR = "${params.DEPLOY_DIR}"
-    DASH_MODE  = "${params.DASH_MODE}"
+    VM_IP = '192.168.199.173'
+    APP_DIR = '/opt/restoringvalues'
+    SSH_USER = 'ubuntu'
+    SSH_CRED = 'Andrey-heatvm'   // <-- ID credential с cloudkey.pem
+    ARTIFACT_JOB = 'AndreyLAb2'    // <-- job, который собирает artifact-restoringvalues.tgz
   }
 
   stages {
@@ -29,125 +25,108 @@ pipeline {
 
     stage('Get artifact from Build job') {
       steps {
-        copyArtifacts(
-          projectName: params.BUILD_JOB,
-          selector: (params.BUILD_NUMBER == 'lastSuccessfulBuild'
-            ? lastSuccessful()
-            : specific(params.BUILD_NUMBER)),
-          filter: "${env.ARTIFACT}",
+        copyArtifacts projectName: "${env.ARTIFACT_JOB}",
+          selector: lastSuccessful(),
+          filter: 'artifact-restoringvalues.tgz',
           fingerprintArtifacts: true
-        )
-
-        sh '''#!/usr/bin/env bash
-          set -euo pipefail
-          ls -la "$ARTIFACT"
-        '''
+        sh 'ls -la artifact-restoringvalues.tgz'
       }
     }
 
     stage('Deploy to VM + systemd (with Dash)') {
       steps {
-        withCredentials([sshUserPrivateKey(
-          credentialsId: params.SSH_CRED_ID,
-          keyFileVariable: 'SSH_KEY',
-          usernameVariable: 'SSH_USER'
-        )]) {
+        withCredentials([sshUserPrivateKey(credentialsId: "${env.SSH_CRED}", keyFileVariable: 'SSH_KEY')]) {
           sh '''#!/usr/bin/env bash
-            set -euo pipefail
+set -euo pipefail
 
-            echo "==> Deploy $ARTIFACT to $SSH_USER@$VM_IP:$DEPLOY_DIR (dash=$DASH_MODE)"
+DASH_MODE="${DASH_MODE:-prod}"
+if [ "$DASH_MODE" = "prod" ]; then
+  DASH_FILE="GUI/dash_app_prod.py"
+  DASH_PORT="8051"
+else
+  DASH_FILE="GUI/dash_app_test.py"
+  DASH_PORT="8050"
+fi
 
-            # 1) prepare dir
-            ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "$SSH_USER@$VM_IP" \
-              "sudo mkdir -p '$DEPLOY_DIR' && sudo chown $SSH_USER:$SSH_USER '$DEPLOY_DIR'"
+echo "==> Deploy artifact-restoringvalues.tgz to ${SSH_USER}@${VM_IP}:${APP_DIR} (dash=$DASH_MODE)"
 
-            # 2) upload artifact
-            scp -o StrictHostKeyChecking=no -i "$SSH_KEY" "$ARTIFACT" "$SSH_USER@$VM_IP:$DEPLOY_DIR/"
+# 1) копируем артефакт
+scp -i "$SSH_KEY" -o StrictHostKeyChecking=no artifact-restoringvalues.tgz ${SSH_USER}@${VM_IP}:/tmp/artifact-restoringvalues.tgz
 
-            # 3) unpack + deps + venv + systemd + start
-            ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "$SSH_USER@$VM_IP" "bash -lc '
-              set -euo pipefail
-              cd \"$DEPLOY_DIR\"
+# 2) всё остальное делаем на VM
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no ${SSH_USER}@${VM_IP} bash -s -- "$DASH_FILE" "$DASH_PORT" <<'EOS'
+set -euo pipefail
+DASH_FILE="$1"
+DASH_PORT="$2"
+APP_DIR="/opt/restoringvalues"
 
-              echo \"==> Unpack\"
-              tar -xzf \"$ARTIFACT\"
+echo "==> Prepare dirs"
+sudo mkdir -p "$APP_DIR"
+sudo chown -R ubuntu:ubuntu "$APP_DIR"
 
-              echo \"==> System deps\"
-              sudo apt-get update -y
-              sudo apt-get install -y python3-venv python3-pip
+echo "==> Unpack artifact"
+cd "$APP_DIR"
+rm -rf Simulator Reciever Business GUI requirements.txt *.log || true
+tar -xzf /tmp/artifact-restoringvalues.tgz
+rm -f /tmp/artifact-restoringvalues.tgz
 
-              echo \"==> venv + pip\"
-              rm -rf .venv
-              python3 -m venv .venv
-              . .venv/bin/activate
-              pip install -U pip wheel
-              pip install -r requirements.txt
+echo "==> Install runtime deps"
+sudo apt-get update -y
+sudo apt-get install -y python3-venv python3-pip
 
-              if [ \"$DASH_MODE\" = \"test\" ]; then
-                DASH_FILE=\"GUI/dash_app_test.py\"
-                DASH_PORT=8050
-              else
-                DASH_FILE=\"GUI/dash_app_prod.py\"
-                DASH_PORT=8051
-              fi
+echo "==> Create venv"
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -U pip wheel
+pip install -r requirements.txt
 
-              echo \"==> Write systemd unit\"
-              sudo tee /etc/systemd/system/restoringvalues.service >/dev/null <<EOF
+echo "==> Create systemd unit"
+SERVICE_FILE="/etc/systemd/system/restoringvalues.service"
+sudo tee "$SERVICE_FILE" >/dev/null <<UNIT
 [Unit]
-Description=RestoringValues (sim+recv+business+dash)
+Description=RestoringValues demo (Simulator + Reciever + Business + Dash)
 After=network.target
 
 [Service]
 Type=simple
-User=$SSH_USER
-WorkingDirectory=$DEPLOY_DIR
+User=ubuntu
+WorkingDirectory=/opt/restoringvalues
 Environment=WEBSOCKET_HOST=127.0.0.1
+ExecStart=/bin/bash -lc '
+set -e
+cd /opt/restoringvalues
+. .venv/bin/activate
 
-ExecStart=/bin/bash -lc \"
-  set -e
-  pkill -f 'Simulator/simulator.py' || true
-  pkill -f 'Reciever/reciever.py' || true
-  pkill -f 'Business/business.py' || true
-  pkill -f 'GUI/dash_app_' || true
+# чистим старые файлы
+rm -f Reciever/*.csv Business/*.csv Business/data_out_*.csv Business/data_metrics_*.csv || true
 
-  $DEPLOY_DIR/.venv/bin/python3 Simulator/simulator.py > simulator.log 2>&1 &
-  $DEPLOY_DIR/.venv/bin/python3 Reciever/reciever.py   > reciever.log  2>&1 &
-  $DEPLOY_DIR/.venv/bin/python3 Business/business.py   > business.log  2>&1 &
-  $DEPLOY_DIR/.venv/bin/python3 $DASH_FILE             > dash.log     2>&1 &
-
-  wait
-\"
-
+# стартуем процессы
+nohup python3 Simulator/simulator.py > simulator.log 2>&1 &
+nohup python3 Reciever/reciever.py  > reciever.log 2>&1 &
+nohup python3 Business/business.py  > business.log 2>&1 &
+exec python3 '"$DASH_FILE"' --host 0.0.0.0 --port '"$DASH_PORT"' > dash.log 2>&1
+'
 Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
 
-              echo \"==> Firewall (if ufw active)\"
-              if sudo ufw status | grep -qi active; then
-                sudo ufw allow 8050/tcp || true
-                sudo ufw allow 8051/tcp || true
-              fi
+echo "==> Restart service"
+sudo systemctl daemon-reload
+sudo systemctl enable restoringvalues.service
+sudo systemctl restart restoringvalues.service
 
-              echo \"==> Restart service\"
-              sudo systemctl daemon-reload
-              sudo systemctl enable restoringvalues
-              sudo systemctl restart restoringvalues
+echo "==> Status"
+sudo systemctl --no-pager -l status restoringvalues.service || true
 
-              echo \"==> Status\"
-              sudo systemctl --no-pager --full status restoringvalues | tail -n 80
+echo "==> Listening ports (should include 8092-8095 and ${DASH_PORT})"
+ss -lntp | egrep ":8092|:8093|:8094|:8095|:${DASH_PORT}" || true
 
-              echo \"==> Listening ports\"
-              ss -lnt | egrep \":(8092|8093|8094|8095|8050|8051)\\s\" || true
-
-              echo \"==> Dash local check\"
-              curl -sS -I http://127.0.0.1:$DASH_PORT | head -n 1 || (echo \"Dash not responding\"; tail -n 200 dash.log; exit 1)
-
-              echo \"==> Dash URL: http://$VM_IP:$DASH_PORT\"
-            '"
-          '''
+echo "==> Dash URL: http://$(hostname -I | awk '{print $1}'):${DASH_PORT}"
+EOS
+'''
         }
       }
     }
