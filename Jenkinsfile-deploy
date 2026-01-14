@@ -1,3 +1,5 @@
+// Jenkinsfile-deploy
+// LAB4: забираем артефакт из job сборки (LAB2) и деплоим на VM 192.168.199.173 по SSH
 pipeline {
   agent { label 'tool' }
 
@@ -7,10 +9,15 @@ pipeline {
   }
 
   parameters {
-    string(name: 'VM_IP', defaultValue: '192.168.199.173', description: 'Target VM IP')
-    string(name: 'BUILD_JOB', defaultValue: 'AndreyLAb2', description: 'Job that builds & archives artifact-restoringvalues.tgz')
-    string(name: 'SSH_CRED_ID', defaultValue: 'ubuntu-agent-ssh', description: 'Jenkins SSH credential id for ubuntu@VM')
-    booleanParam(name: 'ENABLE_DASH', defaultValue: true, description: 'Run Dash UI on port 8051')
+    string(name: 'BUILD_JOB', defaultValue: 'AndreyLAb2', description: 'Имя job из ЛАБ2, где архивируется artifact-restoringvalues.tgz')
+    string(name: 'BUILD_NUMBER', defaultValue: 'lastSuccessfulBuild', description: 'Номер сборки (можно lastSuccessfulBuild)')
+    string(name: 'VM_IP', defaultValue: '192.168.199.173', description: 'IP VM для деплоя')
+    string(name: 'SSH_CRED_ID', defaultValue: 'ubuntu-agent-ssh', description: 'Jenkins CredentialsId типа "SSH Username with private key"')
+    string(name: 'DEPLOY_DIR', defaultValue: '/opt/restoringvalues', description: 'Куда деплоить на VM')
+  }
+
+  environment {
+    ARTIFACT = 'artifact-restoringvalues.tgz'
   }
 
   stages {
@@ -20,184 +27,102 @@ pipeline {
 
     stage('Get artifact from Build job') {
       steps {
-        // забираем последний успешный артефакт
+        // NB: Copy Artifact plugin должен быть установлен (у тебя он уже работает)
         copyArtifacts(
           projectName: params.BUILD_JOB,
-          selector: lastSuccessful(),
-          filter: 'artifact-restoringvalues.tgz',
+          selector: (params.BUILD_NUMBER == 'lastSuccessfulBuild'
+                    ? lastSuccessful()
+                    : specific(params.BUILD_NUMBER)),
+          filter: "${env.ARTIFACT}",
           fingerprintArtifacts: true
         )
+
         sh '''#!/usr/bin/env bash
-          set -e
-          ls -la artifact-restoringvalues.tgz
+          set -euo pipefail
+          ls -la "${ARTIFACT}"
         '''
       }
     }
 
     stage('Deploy to VM (systemd)') {
       steps {
-        sshagent(credentials: [params.SSH_CRED_ID]) {
+        withCredentials([sshUserPrivateKey(
+          credentialsId: params.SSH_CRED_ID,
+          keyFileVariable: 'SSH_KEY',
+          usernameVariable: 'SSH_USER'
+        )]) {
           sh '''#!/usr/bin/env bash
             set -euo pipefail
 
             VM_IP="${VM_IP}"
-            ART="artifact-restoringvalues.tgz"
-            REMOTE_DIR="/opt/restoringvalues"
-            TMP_DIR="/tmp/restoringvalues_deploy"
+            DEPLOY_DIR="${DEPLOY_DIR}"
+            ARTIFACT="${ARTIFACT}"
 
-            echo "==> Copy artifact to ${VM_IP}"
-            ssh -o StrictHostKeyChecking=no ubuntu@"$VM_IP" "sudo mkdir -p ${REMOTE_DIR} ${TMP_DIR} && sudo chown -R ubuntu:ubuntu ${REMOTE_DIR} ${TMP_DIR}"
+            echo "==> Deploy ${ARTIFACT} to ${SSH_USER}@${VM_IP}:${DEPLOY_DIR}"
 
-            scp -o StrictHostKeyChecking=no "$ART" ubuntu@"$VM_IP":"$TMP_DIR/$ART"
+            # 1) подготовка папки на VM
+            ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "${SSH_USER}@${VM_IP}" "sudo mkdir -p '${DEPLOY_DIR}' && sudo chown ${SSH_USER}:${SSH_USER} '${DEPLOY_DIR}'"
 
-            echo "==> Remote deploy"
-            ssh -o StrictHostKeyChecking=no ubuntu@"$VM_IP" "bash -s" <<'REMOTE'
+            # 2) загрузка артефакта
+            scp -o StrictHostKeyChecking=no -i "$SSH_KEY" "${ARTIFACT}" "${SSH_USER}@${VM_IP}:${DEPLOY_DIR}/"
+
+            # 3) распаковка + venv + зависимости + systemd unit + рестарт
+            ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "${SSH_USER}@${VM_IP}" "bash -lc '
               set -euo pipefail
+              cd \"${DEPLOY_DIR}\"
 
-              REMOTE_DIR="/opt/restoringvalues"
-              TMP_DIR="/tmp/restoringvalues_deploy"
-              ART="artifact-restoringvalues.tgz"
+              echo \"==> Unpack\"
+              tar -xzf \"${ARTIFACT}\"
 
-              echo "==> Install system deps"
+              echo \"==> Ensure python3-venv\"
               sudo apt-get update -y
-              sudo apt-get install -y python3-venv python3-pip net-tools lsof
+              sudo apt-get install -y python3-venv python3-pip
 
-              echo "==> Stop old services if exist"
-              sudo systemctl stop restoring-simulator.service 2>/dev/null || true
-              sudo systemctl stop restoring-reciever.service 2>/dev/null || true
-              sudo systemctl stop restoring-business.service 2>/dev/null || true
-              sudo systemctl stop restoring-dash.service 2>/dev/null || true
-
-              echo "==> Kill listeners (8092-8095, 8051) just in case"
-              for p in 8092 8093 8094 8095 8051; do
-                sudo fuser -k ${p}/tcp 2>/dev/null || true
-              done
-
-              echo "==> Unpack artifact"
-              mkdir -p "$REMOTE_DIR"
-              rm -rf "$REMOTE_DIR/Simulator" "$REMOTE_DIR/Reciever" "$REMOTE_DIR/Business" "$REMOTE_DIR/GUI" "$REMOTE_DIR/.venv" || true
-              tar -xzf "$TMP_DIR/$ART" -C "$REMOTE_DIR"
-
-              echo "==> Create venv & install requirements"
-              cd "$REMOTE_DIR"
+              echo \"==> Create venv + install deps\"
+              rm -rf .venv
               python3 -m venv .venv
               . .venv/bin/activate
               pip install -U pip wheel
               pip install -r requirements.txt
 
-              echo "==> Create systemd units"
-
-              # Simulator
-              sudo tee /etc/systemd/system/restoring-simulator.service >/dev/null <<'EOF'
+              echo \"==> Write systemd unit\"
+              sudo tee /etc/systemd/system/restoringvalues.service >/dev/null <<EOF
 [Unit]
-Description=RestoringValues Simulator
+Description=RestoringValues services (sim+recv+business)
 After=network.target
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/opt/restoringvalues
+User=${SSH_USER}
+WorkingDirectory=${DEPLOY_DIR}
 Environment=WEBSOCKET_HOST=127.0.0.1
-ExecStart=/opt/restoringvalues/.venv/bin/python3 /opt/restoringvalues/Simulator/simulator.py
+
+# Запускаем 3 процесса, GUI не трогаем
+ExecStart=/bin/bash -lc \"
+  set -e
+  ${DEPLOY_DIR}/.venv/bin/python3 Simulator/simulator.py  > simulator.log 2>&1 &
+  ${DEPLOY_DIR}/.venv/bin/python3 Reciever/reciever.py    > reciever.log  2>&1 &
+  ${DEPLOY_DIR}/.venv/bin/python3 Business/business.py    > business.log  2>&1 &
+  wait
+\"
+
 Restart=always
-RestartSec=2
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-              # Reciever
-              sudo tee /etc/systemd/system/restoring-reciever.service >/dev/null <<'EOF'
-[Unit]
-Description=RestoringValues Reciever
-After=network.target restoring-simulator.service
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/opt/restoringvalues
-Environment=WEBSOCKET_HOST=127.0.0.1
-ExecStart=/opt/restoringvalues/.venv/bin/python3 /opt/restoringvalues/Reciever/reciever.py
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-              # Business
-              sudo tee /etc/systemd/system/restoring-business.service >/dev/null <<'EOF'
-[Unit]
-Description=RestoringValues Business
-After=network.target restoring-reciever.service
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/opt/restoringvalues
-Environment=WEBSOCKET_HOST=127.0.0.1
-ExecStart=/opt/restoringvalues/.venv/bin/python3 /opt/restoringvalues/Business/business.py
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-              # Dash (optional)
-              sudo tee /etc/systemd/system/restoring-dash.service >/dev/null <<'EOF'
-[Unit]
-Description=RestoringValues Dash UI
-After=network.target restoring-business.service
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/opt/restoringvalues
-Environment=WEBSOCKET_HOST=127.0.0.1
-ExecStart=/opt/restoringvalues/.venv/bin/python3 /opt/restoringvalues/GUI/dash_app_prod.py
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-              echo "==> Reload systemd"
+              echo \"==> Restart service\"
               sudo systemctl daemon-reload
+              sudo systemctl enable restoringvalues
+              sudo systemctl restart restoringvalues
 
-              echo "==> Enable + start services"
-              sudo systemctl enable restoring-simulator.service restoring-reciever.service restoring-business.service >/dev/null
+              echo \"==> Status (last lines)\"
+              sudo systemctl --no-pager --full status restoringvalues | tail -n 60
+            '"
 
-              sudo systemctl restart restoring-simulator.service
-              sudo systemctl restart restoring-reciever.service
-              sudo systemctl restart restoring-business.service
-
-              if [ "${ENABLE_DASH:-true}" = "true" ]; then
-                sudo systemctl enable restoring-dash.service >/dev/null || true
-                sudo systemctl restart restoring-dash.service || true
-              else
-                sudo systemctl stop restoring-dash.service 2>/dev/null || true
-              fi
-
-              echo "==> Quick health checks"
-              sleep 5
-              sudo systemctl --no-pager --full status restoring-simulator.service | head -n 30 || true
-              sudo systemctl --no-pager --full status restoring-reciever.service | head -n 30 || true
-              sudo systemctl --no-pager --full status restoring-business.service | head -n 30 || true
-              if [ "${ENABLE_DASH:-true}" = "true" ]; then
-                sudo systemctl --no-pager --full status restoring-dash.service | head -n 30 || true
-              fi
-
-              echo "==> Check listening ports"
-              sudo ss -lntp | egrep ':8092|:8093|:8094|:8095|:8051' || true
-
-              echo "==> Wait a bit and check Reciever output"
-              sleep 10
-              ls -la /opt/restoringvalues/Reciever/*.csv 2>/dev/null || true
-
-              echo "DEPLOY OK"
-REMOTE
+            echo "==> Deploy OK"
           '''
         }
       }
