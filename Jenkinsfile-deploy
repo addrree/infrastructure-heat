@@ -24,12 +24,19 @@ pipeline {
     steps {
         script {
         def vmIp = sh(
-            script: 'openstack stack output show andrey-heat-stack server_ip -f value | tail -n 1',
+            script: '''
+            bash -lc '
+                set -e
+                source /home/ubuntu/openrc-jenkins.sh
+                openstack token issue >/dev/null
+                openstack stack output show andrey-heat-stack server_ip -f value | tail -n 1
+            '
+            ''',
             returnStdout: true
         ).trim()
 
         if (!vmIp) {
-            error("VM_IP is empty. Heat stack has no server_ip output.")
+            error("VM_IP is empty. Heat stack has no server_ip output or OpenStack auth failed.")
         }
 
         env.VM_IP = vmIp
