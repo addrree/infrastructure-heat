@@ -50,7 +50,7 @@ pipeline {
         # пример: рестарт (если у тебя systemd сервис)
         ssh -o StrictHostKeyChecking=no ubuntu@${VM_IP} 'sudo systemctl restart myapp || true'
         '''
-        }
+        
       }
     }
   }
