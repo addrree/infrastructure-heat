@@ -17,6 +17,9 @@ pipeline {
 
   environment {
     ARTIFACT = 'artifact-restoringvalues.tgz'
+    VM_IP    = "${params.VM_IP}"
+    DEPLOY_DIR = "${params.DEPLOY_DIR}"
+    DASH_MODE  = "${params.DASH_MODE}"
   }
 
   stages {
@@ -37,7 +40,7 @@ pipeline {
 
         sh '''#!/usr/bin/env bash
           set -euo pipefail
-          ls -la "${ARTIFACT}"
+          ls -la "$ARTIFACT"
         '''
       }
     }
@@ -49,30 +52,25 @@ pipeline {
           keyFileVariable: 'SSH_KEY',
           usernameVariable: 'SSH_USER'
         )]) {
-          sh """#!/usr/bin/env bash
+          sh '''#!/usr/bin/env bash
             set -euo pipefail
 
-            VM_IP="${params.VM_IP}"
-            DEPLOY_DIR="${params.DEPLOY_DIR}"
-            ARTIFACT="${env.ARTIFACT}"
-            DASH_MODE="${params.DASH_MODE}"
-
-            echo "==> Deploy \${ARTIFACT} to \${SSH_USER}@\${VM_IP}:\${DEPLOY_DIR} (dash=\${DASH_MODE})"
+            echo "==> Deploy $ARTIFACT to $SSH_USER@$VM_IP:$DEPLOY_DIR (dash=$DASH_MODE)"
 
             # 1) prepare dir
-            ssh -o StrictHostKeyChecking=no -i "\$SSH_KEY" "\${SSH_USER}@\${VM_IP}" \\
-              "sudo mkdir -p '\${DEPLOY_DIR}' && sudo chown \${SSH_USER}:\${SSH_USER} '\${DEPLOY_DIR}'"
+            ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "$SSH_USER@$VM_IP" \
+              "sudo mkdir -p '$DEPLOY_DIR' && sudo chown $SSH_USER:$SSH_USER '$DEPLOY_DIR'"
 
             # 2) upload artifact
-            scp -o StrictHostKeyChecking=no -i "\$SSH_KEY" "\${ARTIFACT}" "\${SSH_USER}@\${VM_IP}:\${DEPLOY_DIR}/"
+            scp -o StrictHostKeyChecking=no -i "$SSH_KEY" "$ARTIFACT" "$SSH_USER@$VM_IP:$DEPLOY_DIR/"
 
             # 3) unpack + deps + venv + systemd + start
-            ssh -o StrictHostKeyChecking=no -i "\$SSH_KEY" "\${SSH_USER}@\${VM_IP}" "bash -lc '
+            ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "$SSH_USER@$VM_IP" "bash -lc '
               set -euo pipefail
-              cd \"\${DEPLOY_DIR}\"
+              cd \"$DEPLOY_DIR\"
 
               echo \"==> Unpack\"
-              tar -xzf \"\${ARTIFACT}\"
+              tar -xzf \"$ARTIFACT\"
 
               echo \"==> System deps\"
               sudo apt-get update -y
@@ -85,7 +83,7 @@ pipeline {
               pip install -U pip wheel
               pip install -r requirements.txt
 
-              if [ \"${params.DASH_MODE}\" = \"test\" ]; then
+              if [ \"$DASH_MODE\" = \"test\" ]; then
                 DASH_FILE=\"GUI/dash_app_test.py\"
                 DASH_PORT=8050
               else
@@ -101,11 +99,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=${'$'}{USER}
-WorkingDirectory=${params.DEPLOY_DIR}
+User=$SSH_USER
+WorkingDirectory=$DEPLOY_DIR
 Environment=WEBSOCKET_HOST=127.0.0.1
-Environment=DASH_HOST=0.0.0.0
-Environment=DASH_PORT=${'$'}{DASH_PORT}
 
 ExecStart=/bin/bash -lc \"
   set -e
@@ -114,10 +110,10 @@ ExecStart=/bin/bash -lc \"
   pkill -f 'Business/business.py' || true
   pkill -f 'GUI/dash_app_' || true
 
-  ${params.DEPLOY_DIR}/.venv/bin/python3 Simulator/simulator.py > simulator.log 2>&1 &
-  ${params.DEPLOY_DIR}/.venv/bin/python3 Reciever/reciever.py   > reciever.log  2>&1 &
-  ${params.DEPLOY_DIR}/.venv/bin/python3 Business/business.py   > business.log  2>&1 &
-  ${params.DEPLOY_DIR}/.venv/bin/python3 ${'$'}{DASH_FILE}      > dash.log     2>&1 &
+  $DEPLOY_DIR/.venv/bin/python3 Simulator/simulator.py > simulator.log 2>&1 &
+  $DEPLOY_DIR/.venv/bin/python3 Reciever/reciever.py   > reciever.log  2>&1 &
+  $DEPLOY_DIR/.venv/bin/python3 Business/business.py   > business.log  2>&1 &
+  $DEPLOY_DIR/.venv/bin/python3 $DASH_FILE             > dash.log     2>&1 &
 
   wait
 \"
@@ -129,7 +125,7 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-              echo \"==> UFW ports (if active)\"
+              echo \"==> Firewall (if ufw active)\"
               if sudo ufw status | grep -qi active; then
                 sudo ufw allow 8050/tcp || true
                 sudo ufw allow 8051/tcp || true
@@ -147,11 +143,11 @@ EOF
               ss -lnt | egrep \":(8092|8093|8094|8095|8050|8051)\\s\" || true
 
               echo \"==> Dash local check\"
-              curl -sS -I http://127.0.0.1:\${'$'}{DASH_PORT} | head -n 1 || (echo \"Dash not responding\"; tail -n 200 dash.log; exit 1)
+              curl -sS -I http://127.0.0.1:$DASH_PORT | head -n 1 || (echo \"Dash not responding\"; tail -n 200 dash.log; exit 1)
 
-              echo \"==> Dash URL: http://${params.VM_IP}:\${'$'}{DASH_PORT}\"
+              echo \"==> Dash URL: http://$VM_IP:$DASH_PORT\"
             '"
-          """
+          '''
         }
       }
     }
