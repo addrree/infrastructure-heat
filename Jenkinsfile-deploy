@@ -1,6 +1,3 @@
-// Jenkinsfile-deploy (LAB4)
-// Deploy artifact-restoringvalues.tgz to VM and start Simulator+Reciever+Business+Dash (prod)
-
 pipeline {
   agent { label 'tool' }
 
@@ -32,8 +29,8 @@ pipeline {
         copyArtifacts(
           projectName: params.BUILD_JOB,
           selector: (params.BUILD_NUMBER == 'lastSuccessfulBuild'
-                    ? lastSuccessful()
-                    : specific(params.BUILD_NUMBER)),
+            ? lastSuccessful()
+            : specific(params.BUILD_NUMBER)),
           filter: "${env.ARTIFACT}",
           fingerprintArtifacts: true
         )
@@ -52,43 +49,43 @@ pipeline {
           keyFileVariable: 'SSH_KEY',
           usernameVariable: 'SSH_USER'
         )]) {
-          sh '''#!/usr/bin/env bash
+          sh """#!/usr/bin/env bash
             set -euo pipefail
 
-            VM_IP="${VM_IP}"
-            DEPLOY_DIR="${DEPLOY_DIR}"
-            ARTIFACT="${ARTIFACT}"
-            DASH_MODE="${DASH_MODE}"
+            VM_IP="${params.VM_IP}"
+            DEPLOY_DIR="${params.DEPLOY_DIR}"
+            ARTIFACT="${env.ARTIFACT}"
+            DASH_MODE="${params.DASH_MODE}"
 
-            echo "==> Deploy ${ARTIFACT} to ${SSH_USER}@${VM_IP}:${DEPLOY_DIR}"
+            echo "==> Deploy \${ARTIFACT} to \${SSH_USER}@\${VM_IP}:\${DEPLOY_DIR} (dash=\${DASH_MODE})"
 
-            # 1) подготовка папки
-            ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "${SSH_USER}@${VM_IP}" "sudo mkdir -p '${DEPLOY_DIR}' && sudo chown ${SSH_USER}:${SSH_USER} '${DEPLOY_DIR}'"
+            # 1) prepare dir
+            ssh -o StrictHostKeyChecking=no -i "\$SSH_KEY" "\${SSH_USER}@\${VM_IP}" \\
+              "sudo mkdir -p '\${DEPLOY_DIR}' && sudo chown \${SSH_USER}:\${SSH_USER} '\${DEPLOY_DIR}'"
 
-            # 2) заливка артефакта
-            scp -o StrictHostKeyChecking=no -i "$SSH_KEY" "${ARTIFACT}" "${SSH_USER}@${VM_IP}:${DEPLOY_DIR}/"
+            # 2) upload artifact
+            scp -o StrictHostKeyChecking=no -i "\$SSH_KEY" "\${ARTIFACT}" "\${SSH_USER}@\${VM_IP}:\${DEPLOY_DIR}/"
 
-            # 3) распаковка + venv + systemd
-            ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "${SSH_USER}@${VM_IP}" "bash -lc '
+            # 3) unpack + deps + venv + systemd + start
+            ssh -o StrictHostKeyChecking=no -i "\$SSH_KEY" "\${SSH_USER}@\${VM_IP}" "bash -lc '
               set -euo pipefail
-              cd \"${DEPLOY_DIR}\"
+              cd \"\${DEPLOY_DIR}\"
 
               echo \"==> Unpack\"
-              tar -xzf \"${ARTIFACT}\"
+              tar -xzf \"\${ARTIFACT}\"
 
-              echo \"==> Install system deps\"
+              echo \"==> System deps\"
               sudo apt-get update -y
               sudo apt-get install -y python3-venv python3-pip
 
-              echo \"==> Create venv + install deps\"
+              echo \"==> venv + pip\"
               rm -rf .venv
               python3 -m venv .venv
               . .venv/bin/activate
               pip install -U pip wheel
               pip install -r requirements.txt
 
-              # Выбираем какой dash запускать
-              if [ \"${DASH_MODE}\" = \"test\" ]; then
+              if [ \"${params.DASH_MODE}\" = \"test\" ]; then
                 DASH_FILE=\"GUI/dash_app_test.py\"
                 DASH_PORT=8050
               else
@@ -96,38 +93,31 @@ pipeline {
                 DASH_PORT=8051
               fi
 
-              echo \"==> Write systemd unit (Dash: ${DASH_MODE} on ${DASH_PORT})\"
+              echo \"==> Write systemd unit\"
               sudo tee /etc/systemd/system/restoringvalues.service >/dev/null <<EOF
 [Unit]
-Description=RestoringValues services (sim+recv+business+dash)
+Description=RestoringValues (sim+recv+business+dash)
 After=network.target
 
 [Service]
 Type=simple
-User=${SSH_USER}
-WorkingDirectory=${DEPLOY_DIR}
-
-# важно: simulator/receiver должны коннектиться к локальному WS
+User=${'$'}{USER}
+WorkingDirectory=${params.DEPLOY_DIR}
 Environment=WEBSOCKET_HOST=127.0.0.1
-# важно: dash должен слушать снаружи (если в коде есть HOST/ADDRESS env — подхватит)
 Environment=DASH_HOST=0.0.0.0
-Environment=DASH_PORT=${DASH_PORT}
+Environment=DASH_PORT=${'$'}{DASH_PORT}
 
 ExecStart=/bin/bash -lc \"
   set -e
-
-  # убьём старые хвосты, если вдруг остались (на всякий)
   pkill -f 'Simulator/simulator.py' || true
   pkill -f 'Reciever/reciever.py' || true
   pkill -f 'Business/business.py' || true
   pkill -f 'GUI/dash_app_' || true
 
-  ${DEPLOY_DIR}/.venv/bin/python3 Simulator/simulator.py > simulator.log 2>&1 &
-  ${DEPLOY_DIR}/.venv/bin/python3 Reciever/reciever.py   > reciever.log  2>&1 &
-  ${DEPLOY_DIR}/.venv/bin/python3 Business/business.py   > business.log  2>&1 &
-
-  # Dash запускаем последним
-  ${DEPLOY_DIR}/.venv/bin/python3 ${DASH_FILE} > dash.log 2>&1 &
+  ${params.DEPLOY_DIR}/.venv/bin/python3 Simulator/simulator.py > simulator.log 2>&1 &
+  ${params.DEPLOY_DIR}/.venv/bin/python3 Reciever/reciever.py   > reciever.log  2>&1 &
+  ${params.DEPLOY_DIR}/.venv/bin/python3 Business/business.py   > business.log  2>&1 &
+  ${params.DEPLOY_DIR}/.venv/bin/python3 ${'$'}{DASH_FILE}      > dash.log     2>&1 &
 
   wait
 \"
@@ -139,7 +129,7 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-              echo \"==> Try open ports (only if ufw enabled)\"
+              echo \"==> UFW ports (if active)\"
               if sudo ufw status | grep -qi active; then
                 sudo ufw allow 8050/tcp || true
                 sudo ufw allow 8051/tcp || true
@@ -153,16 +143,15 @@ EOF
               echo \"==> Status\"
               sudo systemctl --no-pager --full status restoringvalues | tail -n 80
 
-              echo \"==> Listening ports check\"
+              echo \"==> Listening ports\"
               ss -lnt | egrep \":(8092|8093|8094|8095|8050|8051)\\s\" || true
 
-              echo \"==> Quick dash smoke (local on VM)\"
-              curl -sS -I http://127.0.0.1:${DASH_PORT} | head -n 1 || (echo \"Dash not responding\"; tail -n 200 dash.log; exit 1)
+              echo \"==> Dash local check\"
+              curl -sS -I http://127.0.0.1:\${'$'}{DASH_PORT} | head -n 1 || (echo \"Dash not responding\"; tail -n 200 dash.log; exit 1)
 
-              echo \"==> DONE\"
-              echo \"Dash URL (from your PC): http://${VM_IP}:${DASH_PORT}\"
+              echo \"==> Dash URL: http://${params.VM_IP}:\${'$'}{DASH_PORT}\"
             '"
-          '''
+          """
         }
       }
     }
