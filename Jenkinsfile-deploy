@@ -21,39 +21,35 @@ pipeline {
     }
 
     stage('Get VM IP from Heat') {
-      steps {
-        sh '''#!/bin/bash
-          set -euo pipefail
-          . /home/ubuntu/openrc-jenkins.sh
-          VM_IP="$(openstack stack output show "${STACK_NAME}" server_ip -f value | tail -n 1)"
-          echo "VM_IP=$VM_IP" | tee vm_ip.env
-        '''
+    steps {
         script {
-          def props = readProperties file: 'vm_ip.env'
-          env.VM_IP = props['VM_IP']
+        def vmIp = sh(
+            script: 'openstack stack output show andrey-heat-stack server_ip -f value | tail -n 1',
+            returnStdout: true
+        ).trim()
+
+        if (!vmIp) {
+            error("VM_IP is empty. Heat stack has no server_ip output.")
+        }
+
+        env.VM_IP = vmIp
+        echo "VM_IP=${env.VM_IP}"
         }
       }
     }
 
     stage('Deploy + restart') {
-      steps {
-        sshagent(credentials: ['andreyil-ssh']) {
-          sh '''#!/bin/bash
-            set -euo pipefail
-            JAR="$(ls -1 target/*.jar | head -n 1)"
-            echo "Deploy $JAR -> $VM_IP"
+    steps {
+        sh '''#!/usr/bin/env bash
+        set -euo pipefail
+        echo "Deploy to ${VM_IP}"
 
-            scp -o StrictHostKeyChecking=no "$JAR" "ubuntu@$VM_IP:/home/ubuntu/my-java-app.jar"
+        # пример: кидаем jar на VM
+        scp -o StrictHostKeyChecking=no target/my-java-app-1.0.0.jar ubuntu@${VM_IP}:/home/ubuntu/app.jar
 
-            ssh -o StrictHostKeyChecking=no "ubuntu@$VM_IP" '
-              set -e
-              sudo mkdir -p /opt/my-java-app
-              sudo mv /home/ubuntu/my-java-app.jar /opt/my-java-app/my-java-app.jar
-              sudo chown ubuntu:ubuntu /opt/my-java-app/my-java-app.jar
-              sudo systemctl restart my-java-app
-              sudo systemctl --no-pager --full status my-java-app | head -n 30
-            '
-          '''
+        # пример: рестарт (если у тебя systemd сервис)
+        ssh -o StrictHostKeyChecking=no ubuntu@${VM_IP} 'sudo systemctl restart myapp || true'
+        '''
         }
       }
     }
