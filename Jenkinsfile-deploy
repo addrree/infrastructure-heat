@@ -1,19 +1,21 @@
-// Jenkinsfile-deploy
-// LAB4: забираем артефакт из job сборки (LAB2) и деплоим на VM 192.168.199.173 по SSH
+// Jenkinsfile-deploy (LAB4)
+// Deploy artifact-restoringvalues.tgz to VM and start Simulator+Reciever+Business+Dash (prod)
+
 pipeline {
   agent { label 'tool' }
 
   options {
     timestamps()
-    timeout(time: 15, unit: 'MINUTES')
+    timeout(time: 20, unit: 'MINUTES')
   }
 
   parameters {
-    string(name: 'BUILD_JOB', defaultValue: 'AndreyLAb2', description: 'Имя job из ЛАБ2, где архивируется artifact-restoringvalues.tgz')
-    string(name: 'BUILD_NUMBER', defaultValue: 'lastSuccessfulBuild', description: 'Номер сборки (можно lastSuccessfulBuild)')
+    string(name: 'BUILD_JOB', defaultValue: 'AndreyLAb2', description: 'Job ЛАБ2 с артефактом artifact-restoringvalues.tgz')
+    string(name: 'BUILD_NUMBER', defaultValue: 'lastSuccessfulBuild', description: 'Номер сборки или lastSuccessfulBuild')
     string(name: 'VM_IP', defaultValue: '192.168.199.173', description: 'IP VM для деплоя')
-    string(name: 'SSH_CRED_ID', defaultValue: 'ubuntu-agent-ssh', description: 'Jenkins CredentialsId типа "SSH Username with private key"')
-    string(name: 'DEPLOY_DIR', defaultValue: '/opt/restoringvalues', description: 'Куда деплоить на VM')
+    string(name: 'SSH_CRED_ID', defaultValue: 'ubuntu-agent-ssh', description: 'CredentialsId (SSH Username with private key)')
+    string(name: 'DEPLOY_DIR', defaultValue: '/opt/restoringvalues', description: 'Каталог деплоя на VM')
+    choice(name: 'DASH_MODE', choices: ['prod', 'test'], description: 'prod=8051, test=8050')
   }
 
   environment {
@@ -27,7 +29,6 @@ pipeline {
 
     stage('Get artifact from Build job') {
       steps {
-        // NB: Copy Artifact plugin должен быть установлен (у тебя он уже работает)
         copyArtifacts(
           projectName: params.BUILD_JOB,
           selector: (params.BUILD_NUMBER == 'lastSuccessfulBuild'
@@ -44,7 +45,7 @@ pipeline {
       }
     }
 
-    stage('Deploy to VM (systemd)') {
+    stage('Deploy to VM + systemd (with Dash)') {
       steps {
         withCredentials([sshUserPrivateKey(
           credentialsId: params.SSH_CRED_ID,
@@ -57,16 +58,17 @@ pipeline {
             VM_IP="${VM_IP}"
             DEPLOY_DIR="${DEPLOY_DIR}"
             ARTIFACT="${ARTIFACT}"
+            DASH_MODE="${DASH_MODE}"
 
             echo "==> Deploy ${ARTIFACT} to ${SSH_USER}@${VM_IP}:${DEPLOY_DIR}"
 
-            # 1) подготовка папки на VM
+            # 1) подготовка папки
             ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "${SSH_USER}@${VM_IP}" "sudo mkdir -p '${DEPLOY_DIR}' && sudo chown ${SSH_USER}:${SSH_USER} '${DEPLOY_DIR}'"
 
-            # 2) загрузка артефакта
+            # 2) заливка артефакта
             scp -o StrictHostKeyChecking=no -i "$SSH_KEY" "${ARTIFACT}" "${SSH_USER}@${VM_IP}:${DEPLOY_DIR}/"
 
-            # 3) распаковка + venv + зависимости + systemd unit + рестарт
+            # 3) распаковка + venv + systemd
             ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "${SSH_USER}@${VM_IP}" "bash -lc '
               set -euo pipefail
               cd \"${DEPLOY_DIR}\"
@@ -74,7 +76,7 @@ pipeline {
               echo \"==> Unpack\"
               tar -xzf \"${ARTIFACT}\"
 
-              echo \"==> Ensure python3-venv\"
+              echo \"==> Install system deps\"
               sudo apt-get update -y
               sudo apt-get install -y python3-venv python3-pip
 
@@ -85,24 +87,48 @@ pipeline {
               pip install -U pip wheel
               pip install -r requirements.txt
 
-              echo \"==> Write systemd unit\"
+              # Выбираем какой dash запускать
+              if [ \"${DASH_MODE}\" = \"test\" ]; then
+                DASH_FILE=\"GUI/dash_app_test.py\"
+                DASH_PORT=8050
+              else
+                DASH_FILE=\"GUI/dash_app_prod.py\"
+                DASH_PORT=8051
+              fi
+
+              echo \"==> Write systemd unit (Dash: ${DASH_MODE} on ${DASH_PORT})\"
               sudo tee /etc/systemd/system/restoringvalues.service >/dev/null <<EOF
 [Unit]
-Description=RestoringValues services (sim+recv+business)
+Description=RestoringValues services (sim+recv+business+dash)
 After=network.target
 
 [Service]
 Type=simple
 User=${SSH_USER}
 WorkingDirectory=${DEPLOY_DIR}
-Environment=WEBSOCKET_HOST=127.0.0.1
 
-# Запускаем 3 процесса, GUI не трогаем
+# важно: simulator/receiver должны коннектиться к локальному WS
+Environment=WEBSOCKET_HOST=127.0.0.1
+# важно: dash должен слушать снаружи (если в коде есть HOST/ADDRESS env — подхватит)
+Environment=DASH_HOST=0.0.0.0
+Environment=DASH_PORT=${DASH_PORT}
+
 ExecStart=/bin/bash -lc \"
   set -e
-  ${DEPLOY_DIR}/.venv/bin/python3 Simulator/simulator.py  > simulator.log 2>&1 &
-  ${DEPLOY_DIR}/.venv/bin/python3 Reciever/reciever.py    > reciever.log  2>&1 &
-  ${DEPLOY_DIR}/.venv/bin/python3 Business/business.py    > business.log  2>&1 &
+
+  # убьём старые хвосты, если вдруг остались (на всякий)
+  pkill -f 'Simulator/simulator.py' || true
+  pkill -f 'Reciever/reciever.py' || true
+  pkill -f 'Business/business.py' || true
+  pkill -f 'GUI/dash_app_' || true
+
+  ${DEPLOY_DIR}/.venv/bin/python3 Simulator/simulator.py > simulator.log 2>&1 &
+  ${DEPLOY_DIR}/.venv/bin/python3 Reciever/reciever.py   > reciever.log  2>&1 &
+  ${DEPLOY_DIR}/.venv/bin/python3 Business/business.py   > business.log  2>&1 &
+
+  # Dash запускаем последним
+  ${DEPLOY_DIR}/.venv/bin/python3 ${DASH_FILE} > dash.log 2>&1 &
+
   wait
 \"
 
@@ -113,16 +139,29 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+              echo \"==> Try open ports (only if ufw enabled)\"
+              if sudo ufw status | grep -qi active; then
+                sudo ufw allow 8050/tcp || true
+                sudo ufw allow 8051/tcp || true
+              fi
+
               echo \"==> Restart service\"
               sudo systemctl daemon-reload
               sudo systemctl enable restoringvalues
               sudo systemctl restart restoringvalues
 
-              echo \"==> Status (last lines)\"
-              sudo systemctl --no-pager --full status restoringvalues | tail -n 60
-            '"
+              echo \"==> Status\"
+              sudo systemctl --no-pager --full status restoringvalues | tail -n 80
 
-            echo "==> Deploy OK"
+              echo \"==> Listening ports check\"
+              ss -lnt | egrep \":(8092|8093|8094|8095|8050|8051)\\s\" || true
+
+              echo \"==> Quick dash smoke (local on VM)\"
+              curl -sS -I http://127.0.0.1:${DASH_PORT} | head -n 1 || (echo \"Dash not responding\"; tail -n 200 dash.log; exit 1)
+
+              echo \"==> DONE\"
+              echo \"Dash URL (from your PC): http://${VM_IP}:${DASH_PORT}\"
+            '"
           '''
         }
       }
