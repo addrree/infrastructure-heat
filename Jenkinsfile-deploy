@@ -125,6 +125,8 @@ set -euo pipefail
 
 cd /opt/restoringvalues/current/app
 
+PY="/opt/restoringvalues/venv/bin/python"
+
 # чистим порты
 for p in 8092 8093 8094 8095; do
   fuser -k ${p}/tcp >/dev/null 2>&1 || true
@@ -138,10 +140,10 @@ start_bg() {
   setsid nohup "$@" > "/opt/restoringvalues/run/${name}.log" 2>&1 & echo $! > "/opt/restoringvalues/run/${name}.pid"
 }
 
-start_bg simulator python3 Simulator/simulator.py
+start_bg simulator "$PY" Simulator/simulator.py
 sleep 1
-start_bg reciever  python3 Reciever/reciever.py
-start_bg business  python3 Business/business.py
+start_bg reciever  "$PY" Reciever/reciever.py
+start_bg business  "$PY" Business/business.py
 
 wait
 SH
