@@ -3,130 +3,185 @@ pipeline {
 
   options {
     timestamps()
-    timeout(time: 20, unit: 'MINUTES')
+    timeout(time: 15, unit: 'MINUTES')
+    disableConcurrentBuilds()
   }
 
   parameters {
-    choice(name: 'DASH_MODE', choices: ['prod', 'test'], description: 'prod => 8051, test => 8050')
-  }
-
-  environment {
-    VM_IP = '192.168.199.173'
-    APP_DIR = '/opt/restoringvalues'
-    SSH_USER = 'ubuntu'
-    SSH_CRED = 'Andrey-heatvm'   // <-- ID credential с cloudkey.pem
-    ARTIFACT_JOB = 'AndreyLAb2'    // <-- job, который собирает artifact-restoringvalues.tgz
+    string(name: 'TARGET_HOST', defaultValue: '192.168.199.173', description: 'Deploy host')
+    string(name: 'TARGET_USER', defaultValue: 'ubuntu', description: 'SSH user')
+    string(name: 'BUILD_JOB', defaultValue: 'RestoringValues-Build', description: 'Job name from L2 that produces dist/*.whl')
+    string(name: 'SSH_CRED_ID', defaultValue: 'Andrey-heatvm', description: 'Andrey-heatvm')
   }
 
   stages {
-    stage('Checkout') {
-      steps { checkout scm }
-    }
 
-    stage('Get artifact from Build job') {
+    stage('Fetch artifact from L2') {
       steps {
-        copyArtifacts projectName: "${env.ARTIFACT_JOB}",
-          selector: lastSuccessful(),
-          filter: 'artifact-restoringvalues.tgz',
-          fingerprintArtifacts: true
-        sh 'ls -la artifact-restoringvalues.tgz'
+        script {
+          // Папка для артефактов в workspace
+          sh 'rm -rf deploy_art && mkdir -p deploy_art'
+
+          // 1) Пытаемся забрать wheel из job Л2 (Copy Artifact plugin)
+          // Если плагина нет/шага нет — упадет, тогда fallback ниже
+          def copied = false
+          try {
+            step([
+              $class: 'CopyArtifact',
+              projectName: params.BUILD_JOB,
+              selector: [$class: 'StatusBuildSelector', stable: false],
+              filter: 'dist/*.whl',
+              target: 'deploy_art',
+              fingerprintArtifacts: true
+            ])
+            copied = true
+          } catch (err) {
+            copied = false
+            echo "CopyArtifact not available or failed, fallback to build in deploy job: ${err}"
+          }
+
+          // 2) Fallback: если не удалось забрать — собираем wheel тут
+          if (!copied) {
+            sh '''#!/usr/bin/env bash
+              set -eux
+              rm -rf .venv_build dist build *.egg-info
+              python3 -m venv .venv_build
+              . .venv_build/bin/activate
+              python -m pip install -U pip build
+              python -m build
+              cp dist/*.whl deploy_art/
+            '''
+          }
+
+          sh 'ls -la deploy_art'
+        }
       }
     }
 
-    stage('Deploy to VM + systemd (with Dash)') {
+    stage('Upload to server') {
       steps {
-        withCredentials([sshUserPrivateKey(credentialsId: "${env.SSH_CRED}", keyFileVariable: 'SSH_KEY')]) {
+        sshagent(credentials: [params.SSH_CRED_ID]) {
           sh '''#!/usr/bin/env bash
-set -euo pipefail
+            set -eux
 
-DASH_MODE="${DASH_MODE:-prod}"
-if [ "$DASH_MODE" = "prod" ]; then
-  DASH_FILE="GUI/dash_app_prod.py"
-  DASH_PORT="8051"
-else
-  DASH_FILE="GUI/dash_app_test.py"
-  DASH_PORT="8050"
-fi
+            WHEEL="$(ls -1 deploy_art/*.whl | head -n 1)"
+            echo "Wheel: $WHEEL"
 
-echo "==> Deploy artifact-restoringvalues.tgz to ${SSH_USER}@${VM_IP}:${APP_DIR} (dash=$DASH_MODE)"
+            # Каталог релиза на сервере
+            REL="/opt/restoringvalues/releases/${BUILD_NUMBER}"
+            ssh -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_HOST} "mkdir -p ${REL}"
 
-# 1) копируем артефакт
-scp -i "$SSH_KEY" -o StrictHostKeyChecking=no artifact-restoringvalues.tgz ${SSH_USER}@${VM_IP}:/tmp/artifact-restoringvalues.tgz
+            # Копируем wheel
+            scp -o StrictHostKeyChecking=no "$WHEEL" ${TARGET_USER}@${TARGET_HOST}:"${REL}/"
 
-# 2) всё остальное делаем на VM
-ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no ${SSH_USER}@${VM_IP} bash -s -- "$DASH_FILE" "$DASH_PORT" <<'EOS'
-set -euo pipefail
-DASH_FILE="$1"
-DASH_PORT="$2"
-APP_DIR="/opt/restoringvalues"
+            # Обновляем симлинк current -> releases/BUILD_NUMBER
+            ssh -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_HOST} "ln -sfn ${REL} /opt/restoringvalues/current"
+          '''
+        }
+      }
+    }
 
-echo "==> Prepare dirs"
-sudo mkdir -p "$APP_DIR"
-sudo chown -R ubuntu:ubuntu "$APP_DIR"
+    stage('Install/Update + restart') {
+      steps {
+        sshagent(credentials: [params.SSH_CRED_ID]) {
+          sh '''#!/usr/bin/env bash
+            set -eux
 
-echo "==> Unpack artifact"
-cd "$APP_DIR"
-rm -rf Simulator Reciever Business GUI requirements.txt *.log || true
-tar -xzf /tmp/artifact-restoringvalues.tgz
-rm -f /tmp/artifact-restoringvalues.tgz
+            ssh -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_HOST} 'bash -s' <<'REMOTE'
+              set -eux
 
-echo "==> Install runtime deps"
-sudo apt-get update -y
-sudo apt-get install -y python3-venv python3-pip
+              cd /opt/restoringvalues/current
+              WHEEL="$(ls -1 *.whl | head -n 1)"
 
-echo "==> Create venv"
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -U pip wheel
-pip install -r requirements.txt
+              # venv (создаем один раз, дальше только обновляем wheel)
+              if [ ! -d /opt/restoringvalues/venv ]; then
+                python3 -m venv /opt/restoringvalues/venv
+              fi
 
-echo "==> Create systemd unit"
-SERVICE_FILE="/etc/systemd/system/restoringvalues.service"
-sudo tee "$SERVICE_FILE" >/dev/null <<UNIT
+              . /opt/restoringvalues/venv/bin/activate
+              python -m pip install -U pip
+
+              # ставим/обновляем wheel
+              python -m pip install --force-reinstall "$WHEEL"
+
+              # Скрипт запуска (чтобы systemd стартовал все 3 процесса)
+              cat >/opt/restoringvalues/bin/start.sh <<'SH'
+              #!/usr/bin/env bash
+              set -euo pipefail
+              cd /opt/restoringvalues/current
+
+              # чистим хвосты/порты
+              for p in 8092 8093 8094 8095; do
+                fuser -k ${p}/tcp >/dev/null 2>&1 || true
+              done
+
+              mkdir -p /opt/restoringvalues/run
+              rm -f /opt/restoringvalues/run/*.pid /opt/restoringvalues/run/*.log || true
+
+              start_bg() {
+                local name="$1"; shift
+                setsid nohup "$@" > "/opt/restoringvalues/run/${name}.log" 2>&1 & echo $! > "/opt/restoringvalues/run/${name}.pid"
+              }
+
+              start_bg simulator python3 Simulator/simulator.py
+              sleep 1
+              start_bg reciever  python3 Reciever/reciever.py
+              start_bg business  python3 Business/business.py
+
+              # держим сервис "живым"
+              wait
+SH
+              chmod +x /opt/restoringvalues/bin/start.sh
+
+              # Скрипт остановки
+              cat >/opt/restoringvalues/bin/stop.sh <<'SH'
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              stop_by_pidfile() {
+                local f="$1"
+                if [ -f "$f" ]; then
+                  pid="$(cat "$f")"
+                  kill -- "-$pid" >/dev/null 2>&1 || true
+                fi
+              }
+
+              stop_by_pidfile /opt/restoringvalues/run/business.pid
+              stop_by_pidfile /opt/restoringvalues/run/reciever.pid
+              stop_by_pidfile /opt/restoringvalues/run/simulator.pid
+
+              for p in 8092 8093 8094 8095; do
+                fuser -k ${p}/tcp >/dev/null 2>&1 || true
+              done
+SH
+              chmod +x /opt/restoringvalues/bin/stop.sh
+
+              # systemd unit
+              sudo tee /etc/systemd/system/restoringvalues.service >/dev/null <<'UNIT'
 [Unit]
-Description=RestoringValues demo (Simulator + Reciever + Business + Dash)
+Description=RestoringValues stack (simulator/reciever/business)
 After=network.target
 
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/opt/restoringvalues
-Environment=WEBSOCKET_HOST=127.0.0.1
-ExecStart=/bin/bash -lc '
-set -e
-cd /opt/restoringvalues
-. .venv/bin/activate
-
-# чистим старые файлы
-rm -f Reciever/*.csv Business/*.csv Business/data_out_*.csv Business/data_metrics_*.csv || true
-
-# стартуем процессы
-nohup python3 Simulator/simulator.py > simulator.log 2>&1 &
-nohup python3 Reciever/reciever.py  > reciever.log 2>&1 &
-nohup python3 Business/business.py  > business.log 2>&1 &
-exec python3 '"$DASH_FILE"' --host 0.0.0.0 --port '"$DASH_PORT"' > dash.log 2>&1
-'
+WorkingDirectory=/opt/restoringvalues/current
+ExecStart=/opt/restoringvalues/bin/start.sh
+ExecStop=/opt/restoringvalues/bin/stop.sh
 Restart=always
-RestartSec=3
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
-echo "==> Restart service"
-sudo systemctl daemon-reload
-sudo systemctl enable restoringvalues.service
-sudo systemctl restart restoringvalues.service
+              sudo systemctl daemon-reload
+              sudo systemctl enable restoringvalues.service
+              sudo systemctl restart restoringvalues.service
 
-echo "==> Status"
-sudo systemctl --no-pager -l status restoringvalues.service || true
-
-echo "==> Listening ports (should include 8092-8095 and ${DASH_PORT})"
-ss -lntp | egrep ":8092|:8093|:8094|:8095|:${DASH_PORT}" || true
-
-echo "==> Dash URL: http://$(hostname -I | awk '{print $1}'):${DASH_PORT}"
-EOS
-'''
+              sudo systemctl --no-pager --full status restoringvalues.service || true
+REMOTE
+          '''
         }
       }
     }
@@ -134,7 +189,7 @@ EOS
 
   post {
     always {
-      echo "Done."
+      archiveArtifacts artifacts: 'deploy_art/*', allowEmptyArchive: true
       cleanWs()
     }
   }
