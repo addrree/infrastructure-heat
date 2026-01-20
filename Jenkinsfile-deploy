@@ -9,18 +9,17 @@ pipeline {
 
   parameters {
     string(name: 'TARGET_HOST', defaultValue: '192.168.199.93', description: 'Deploy host')
-    string(name: 'BUILD_JOB', defaultValue: 'AndreyIL/AndreyLAb2', description: 'L2 job name that produces dist/*.whl')
+    string(name: 'BUILD_JOB', defaultValue: 'AndreyIL/AndreyLAb2', description: 'L2 job name that produces dist/*.whl and app-restoringvalues.tgz')
     string(name: 'SSH_CRED_ID', defaultValue: 'Andrey-heatvm', description: 'Andrey-heatvm')
   }
 
   stages {
 
-    stage('Fetch artifact from L2') {
+    stage('Fetch artifacts from L2') {
       steps {
         script {
           sh 'rm -rf deploy_art && mkdir -p deploy_art'
 
-          // CopyArtifact plugin у тебя есть (видно по логу), поэтому используем его
           step([
             $class: 'CopyArtifact',
             projectName: params.BUILD_JOB,
@@ -30,7 +29,16 @@ pipeline {
             fingerprintArtifacts: true
           ])
 
-          sh 'find deploy_art -maxdepth 3 -type f -print'
+          step([
+            $class: 'CopyArtifact',
+            projectName: params.BUILD_JOB,
+            selector: [$class: 'StatusBuildSelector', stable: false],
+            filter: 'app-restoringvalues.tgz',
+            target: 'deploy_art',
+            fingerprintArtifacts: true
+          ])
+
+          sh 'find deploy_art -maxdepth 4 -type f -print'
         }
       }
     }
@@ -46,35 +54,42 @@ pipeline {
             set -euo pipefail
 
             chmod 600 "$SSH_KEY_FILE"
+            SSH_OPTS="-i $SSH_KEY_FILE -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
-            # wheel может лежать как deploy_art/dist/*.whl или deploy_art/*.whl — обработаем оба варианта
-            WHEEL="$(ls -1 deploy_art/**/*.whl deploy_art/*.whl 2>/dev/null | head -n 1 || true)"
+            WHEEL="$(ls -1 deploy_art/**/dist/*.whl deploy_art/dist/*.whl deploy_art/*.whl 2>/dev/null | head -n 1 || true)"
+            TGZ="$(ls -1 deploy_art/app-restoringvalues.tgz 2>/dev/null | head -n 1 || true)"
+
             if [ -z "$WHEEL" ]; then
               echo "No .whl found in deploy_art. Listing:"
-              find deploy_art -maxdepth 4 -type f -print || true
+              find deploy_art -maxdepth 6 -type f -print || true
+              exit 1
+            fi
+            if [ -z "$TGZ" ]; then
+              echo "No app-restoringvalues.tgz found in deploy_art. Listing:"
+              find deploy_art -maxdepth 6 -type f -print || true
               exit 1
             fi
 
             echo "Using wheel: $WHEEL"
+            echo "Using tgz:   $TGZ"
 
             REL="/opt/restoringvalues/releases/${BUILD_NUMBER}"
-
-            SSH_OPTS="-i $SSH_KEY_FILE -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
             echo "==> Create release dir on server"
             ssh $SSH_OPTS ${SSH_USER}@${TARGET_HOST} "mkdir -p ${REL}"
 
-            echo "==> Upload wheel"
+            echo "==> Upload wheel + app tgz"
             scp $SSH_OPTS "$WHEEL" ${SSH_USER}@${TARGET_HOST}:"${REL}/"
+            scp $SSH_OPTS "$TGZ"   ${SSH_USER}@${TARGET_HOST}:"${REL}/"
 
             echo "==> Point /opt/restoringvalues/current to this release"
             ssh $SSH_OPTS ${SSH_USER}@${TARGET_HOST} "ln -sfn ${REL} /opt/restoringvalues/current"
 
-            echo "==> Install/update + systemd restart"
+            echo "==> Install/update + unpack app + systemd restart"
             ssh $SSH_OPTS ${SSH_USER}@${TARGET_HOST} 'bash -s' <<'REMOTE'
               set -euo pipefail
 
-              # базовая подготовка (можно оставить, даже если уже делал)
+              # базовая подготовка
               sudo apt-get update -y >/dev/null 2>&1 || true
               sudo apt-get install -y python3-venv psmisc >/dev/null 2>&1 || true
 
@@ -82,20 +97,33 @@ pipeline {
               sudo chown -R ubuntu:ubuntu /opt/restoringvalues
 
               cd /opt/restoringvalues/current
-              WHEEL="$(ls -1 *.whl | head -n 1)"
 
+              # 1) распаковываем исходники приложения
+              rm -rf app
+              mkdir -p app
+              TGZ="$(ls -1 app-restoringvalues.tgz | head -n 1)"
+              tar -xzf "$TGZ" -C app
+
+              # sanity-check: должны существовать файлы модулей
+              test -f app/Simulator/simulator.py
+              test -f app/Reciever/reciever.py
+              test -f app/Business/business.py
+
+              # 2) ставим wheel (зависимости/entrypoints)
+              WHEEL="$(ls -1 *.whl | head -n 1)"
               if [ ! -d /opt/restoringvalues/venv ]; then
                 python3 -m venv /opt/restoringvalues/venv
               fi
-
               . /opt/restoringvalues/venv/bin/activate
               python -m pip install -U pip
               python -m pip install --force-reinstall "$WHEEL"
 
+              # 3) start/stop скрипты: запускаем уже из /opt/restoringvalues/current/app
               cat >/opt/restoringvalues/bin/start.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-cd /opt/restoringvalues/current
+
+cd /opt/restoringvalues/current/app
 
 # чистим порты
 for p in 8092 8093 8094 8095; do
@@ -115,7 +143,6 @@ sleep 1
 start_bg reciever  python3 Reciever/reciever.py
 start_bg business  python3 Business/business.py
 
-# держим unit живым
 wait
 SH
               chmod +x /opt/restoringvalues/bin/start.sh
@@ -150,7 +177,7 @@ After=network.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/opt/restoringvalues/current
+WorkingDirectory=/opt/restoringvalues/current/app
 ExecStart=/opt/restoringvalues/bin/start.sh
 ExecStop=/opt/restoringvalues/bin/stop.sh
 Restart=always
