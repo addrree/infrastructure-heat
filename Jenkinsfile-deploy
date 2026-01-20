@@ -9,8 +9,7 @@ pipeline {
 
   parameters {
     string(name: 'TARGET_HOST', defaultValue: '192.168.199.173', description: 'Deploy host')
-    string(name: 'TARGET_USER', defaultValue: 'ubuntu', description: 'SSH user')
-    string(name: 'BUILD_JOB', defaultValue: 'AndreyLAb2', description: 'Job name from L2 that produces dist/*.whl')
+    string(name: 'BUILD_JOB', defaultValue: 'AndreyIL/AndreyLAb2', description: 'L2 job name that produces dist/*.whl')
     string(name: 'SSH_CRED_ID', defaultValue: 'Andrey-heatvm', description: 'Andrey-heatvm')
   }
 
@@ -19,144 +18,130 @@ pipeline {
     stage('Fetch artifact from L2') {
       steps {
         script {
-          // Папка для артефактов в workspace
           sh 'rm -rf deploy_art && mkdir -p deploy_art'
 
-          // 1) Пытаемся забрать wheel из job Л2 (Copy Artifact plugin)
-          // Если плагина нет/шага нет — упадет, тогда fallback ниже
-          def copied = false
-          try {
-            step([
-              $class: 'CopyArtifact',
-              projectName: params.BUILD_JOB,
-              selector: [$class: 'StatusBuildSelector', stable: false],
-              filter: 'dist/*.whl',
-              target: 'deploy_art',
-              fingerprintArtifacts: true
-            ])
-            copied = true
-          } catch (err) {
-            copied = false
-            echo "CopyArtifact not available or failed, fallback to build in deploy job: ${err}"
-          }
+          // CopyArtifact plugin у тебя есть (видно по логу), поэтому используем его
+          step([
+            $class: 'CopyArtifact',
+            projectName: params.BUILD_JOB,
+            selector: [$class: 'StatusBuildSelector', stable: false],
+            filter: 'dist/*.whl',
+            target: 'deploy_art',
+            fingerprintArtifacts: true
+          ])
 
-          // 2) Fallback: если не удалось забрать — собираем wheel тут
-          if (!copied) {
-            sh '''#!/usr/bin/env bash
-              set -eux
-              rm -rf .venv_build dist build *.egg-info
-              python3 -m venv .venv_build
-              . .venv_build/bin/activate
-              python -m pip install -U pip build
-              python -m build
-              cp dist/*.whl deploy_art/
-            '''
-          }
-
-          sh 'ls -la deploy_art'
+          sh 'find deploy_art -maxdepth 3 -type f -print'
         }
       }
     }
 
-    stage('Upload to server') {
+    stage('Upload + install + restart') {
       steps {
-        sshagent(credentials: [params.SSH_CRED_ID]) {
+        withCredentials([sshUserPrivateKey(
+          credentialsId: params.SSH_CRED_ID,
+          keyFileVariable: 'SSH_KEY_FILE',
+          usernameVariable: 'SSH_USER'
+        )]) {
           sh '''#!/usr/bin/env bash
-            set -eux
+            set -euo pipefail
 
-            WHEEL="$(ls -1 deploy_art/*.whl | head -n 1)"
-            echo "Wheel: $WHEEL"
+            chmod 600 "$SSH_KEY_FILE"
 
-            # Каталог релиза на сервере
+            # wheel может лежать как deploy_art/dist/*.whl или deploy_art/*.whl — обработаем оба варианта
+            WHEEL="$(ls -1 deploy_art/**/*.whl deploy_art/*.whl 2>/dev/null | head -n 1 || true)"
+            if [ -z "$WHEEL" ]; then
+              echo "No .whl found in deploy_art. Listing:"
+              find deploy_art -maxdepth 4 -type f -print || true
+              exit 1
+            fi
+
+            echo "Using wheel: $WHEEL"
+
             REL="/opt/restoringvalues/releases/${BUILD_NUMBER}"
-            ssh -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_HOST} "mkdir -p ${REL}"
 
-            # Копируем wheel
-            scp -o StrictHostKeyChecking=no "$WHEEL" ${TARGET_USER}@${TARGET_HOST}:"${REL}/"
+            SSH_OPTS="-i $SSH_KEY_FILE -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
-            # Обновляем симлинк current -> releases/BUILD_NUMBER
-            ssh -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_HOST} "ln -sfn ${REL} /opt/restoringvalues/current"
-          '''
-        }
-      }
-    }
+            echo "==> Create release dir on server"
+            ssh $SSH_OPTS ${SSH_USER}@${TARGET_HOST} "mkdir -p ${REL}"
 
-    stage('Install/Update + restart') {
-      steps {
-        sshagent(credentials: [params.SSH_CRED_ID]) {
-          sh '''#!/usr/bin/env bash
-            set -eux
+            echo "==> Upload wheel"
+            scp $SSH_OPTS "$WHEEL" ${SSH_USER}@${TARGET_HOST}:"${REL}/"
 
-            ssh -o StrictHostKeyChecking=no ${TARGET_USER}@${TARGET_HOST} 'bash -s' <<'REMOTE'
-              set -eux
+            echo "==> Point /opt/restoringvalues/current to this release"
+            ssh $SSH_OPTS ${SSH_USER}@${TARGET_HOST} "ln -sfn ${REL} /opt/restoringvalues/current"
+
+            echo "==> Install/update + systemd restart"
+            ssh $SSH_OPTS ${SSH_USER}@${TARGET_HOST} 'bash -s' <<'REMOTE'
+              set -euo pipefail
+
+              # базовая подготовка (можно оставить, даже если уже делал)
+              sudo apt-get update -y >/dev/null 2>&1 || true
+              sudo apt-get install -y python3-venv psmisc >/dev/null 2>&1 || true
+
+              sudo mkdir -p /opt/restoringvalues/{releases,bin,run}
+              sudo chown -R ubuntu:ubuntu /opt/restoringvalues
 
               cd /opt/restoringvalues/current
               WHEEL="$(ls -1 *.whl | head -n 1)"
 
-              # venv (создаем один раз, дальше только обновляем wheel)
               if [ ! -d /opt/restoringvalues/venv ]; then
                 python3 -m venv /opt/restoringvalues/venv
               fi
 
               . /opt/restoringvalues/venv/bin/activate
               python -m pip install -U pip
-
-              # ставим/обновляем wheel
               python -m pip install --force-reinstall "$WHEEL"
 
-              # Скрипт запуска (чтобы systemd стартовал все 3 процесса)
               cat >/opt/restoringvalues/bin/start.sh <<'SH'
-              #!/usr/bin/env bash
-              set -euo pipefail
-              cd /opt/restoringvalues/current
+#!/usr/bin/env bash
+set -euo pipefail
+cd /opt/restoringvalues/current
 
-              # чистим хвосты/порты
-              for p in 8092 8093 8094 8095; do
-                fuser -k ${p}/tcp >/dev/null 2>&1 || true
-              done
+# чистим порты
+for p in 8092 8093 8094 8095; do
+  fuser -k ${p}/tcp >/dev/null 2>&1 || true
+done
 
-              mkdir -p /opt/restoringvalues/run
-              rm -f /opt/restoringvalues/run/*.pid /opt/restoringvalues/run/*.log || true
+mkdir -p /opt/restoringvalues/run
+rm -f /opt/restoringvalues/run/*.pid /opt/restoringvalues/run/*.log || true
 
-              start_bg() {
-                local name="$1"; shift
-                setsid nohup "$@" > "/opt/restoringvalues/run/${name}.log" 2>&1 & echo $! > "/opt/restoringvalues/run/${name}.pid"
-              }
+start_bg() {
+  local name="$1"; shift
+  setsid nohup "$@" > "/opt/restoringvalues/run/${name}.log" 2>&1 & echo $! > "/opt/restoringvalues/run/${name}.pid"
+}
 
-              start_bg simulator python3 Simulator/simulator.py
-              sleep 1
-              start_bg reciever  python3 Reciever/reciever.py
-              start_bg business  python3 Business/business.py
+start_bg simulator python3 Simulator/simulator.py
+sleep 1
+start_bg reciever  python3 Reciever/reciever.py
+start_bg business  python3 Business/business.py
 
-              # держим сервис "живым"
-              wait
+# держим unit живым
+wait
 SH
               chmod +x /opt/restoringvalues/bin/start.sh
 
-              # Скрипт остановки
               cat >/opt/restoringvalues/bin/stop.sh <<'SH'
-              #!/usr/bin/env bash
-              set -euo pipefail
+#!/usr/bin/env bash
+set -euo pipefail
 
-              stop_by_pidfile() {
-                local f="$1"
-                if [ -f "$f" ]; then
-                  pid="$(cat "$f")"
-                  kill -- "-$pid" >/dev/null 2>&1 || true
-                fi
-              }
+stop_by_pidfile() {
+  local f="$1"
+  if [ -f "$f" ]; then
+    pid="$(cat "$f")"
+    kill -- "-$pid" >/dev/null 2>&1 || true
+  fi
+}
 
-              stop_by_pidfile /opt/restoringvalues/run/business.pid
-              stop_by_pidfile /opt/restoringvalues/run/reciever.pid
-              stop_by_pidfile /opt/restoringvalues/run/simulator.pid
+stop_by_pidfile /opt/restoringvalues/run/business.pid
+stop_by_pidfile /opt/restoringvalues/run/reciever.pid
+stop_by_pidfile /opt/restoringvalues/run/simulator.pid
 
-              for p in 8092 8093 8094 8095; do
-                fuser -k ${p}/tcp >/dev/null 2>&1 || true
-              done
+for p in 8092 8093 8094 8095; do
+  fuser -k ${p}/tcp >/dev/null 2>&1 || true
+done
 SH
               chmod +x /opt/restoringvalues/bin/stop.sh
 
-              # systemd unit
               sudo tee /etc/systemd/system/restoringvalues.service >/dev/null <<'UNIT'
 [Unit]
 Description=RestoringValues stack (simulator/reciever/business)
@@ -176,9 +161,10 @@ WantedBy=multi-user.target
 UNIT
 
               sudo systemctl daemon-reload
-              sudo systemctl enable restoringvalues.service
+              sudo systemctl enable restoringvalues.service >/dev/null 2>&1 || true
               sudo systemctl restart restoringvalues.service
 
+              echo "==> service status"
               sudo systemctl --no-pager --full status restoringvalues.service || true
 REMOTE
           '''
@@ -189,7 +175,7 @@ REMOTE
 
   post {
     always {
-      archiveArtifacts artifacts: 'deploy_art/*', allowEmptyArchive: true
+      archiveArtifacts artifacts: 'deploy_art/**', allowEmptyArchive: true
       cleanWs()
     }
   }
