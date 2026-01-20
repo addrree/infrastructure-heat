@@ -10,7 +10,7 @@ pipeline {
   parameters {
     string(name: 'TARGET_HOST', defaultValue: '192.168.199.173', description: 'Deploy host')
     string(name: 'TARGET_USER', defaultValue: 'ubuntu', description: 'SSH user')
-    string(name: 'BUILD_JOB', defaultValue: 'RestoringValues-Build', description: 'Job name from L2 that produces dist/*.whl')
+    string(name: 'BUILD_JOB', defaultValue: 'AndreyLAb2', description: 'Job name from L2 that produces dist/*.whl')
     string(name: 'SSH_CRED_ID', defaultValue: 'Andrey-heatvm', description: 'Andrey-heatvm')
   }
 
