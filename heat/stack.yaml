@@ -9,7 +9,7 @@ parameters:
 
   image:
     type: string
-    default: ubuntu-20.04
+    default: ununtu-22.04
 
   flavor:
     type: string
