@@ -8,7 +8,7 @@ pipeline {
   }
 
   parameters {
-    string(name: 'TARGET_HOST', defaultValue: '192.168.199.129', description: 'Deploy host')
+    string(name: 'TARGET_HOST', defaultValue: '192.168.199.20', description: 'Deploy host')
     string(name: 'BUILD_JOB', defaultValue: 'KoganSK/KoganSK_pipeline', description: 'L2 job name that produces dist/*.whl and app-restoringvalues.tgz')
     string(name: 'SSH_CRED_ID', defaultValue: 'kogans-ssh', description: 'kogans-ssh')
   }
