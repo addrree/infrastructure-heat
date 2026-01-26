@@ -50,7 +50,7 @@ pipeline {
           keyFileVariable: 'SSH_KEY_FILE',
           usernameVariable: 'SSH_USER'
         )]) {
-          sh '''#!/usr/bi/env bash
+          sh '''#!/usr/bin/env bash
             set -euo pipefail
 
             chmod 600 "$SSH_KEY_FILE"
