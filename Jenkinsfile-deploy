@@ -8,9 +8,9 @@ pipeline {
   }
 
   parameters {
-    string(name: 'TARGET_HOST', defaultValue: '192.168.199.93', description: 'Deploy host')
+    string(name: 'TARGET_HOST', defaultValue: '192.168.199.129', description: 'Deploy host')
     string(name: 'BUILD_JOB', defaultValue: 'KoganSK folder/KoganSK_pipeline', description: 'L2 job name that produces dist/*.whl and app-restoringvalues.tgz')
-    string(name: 'SSH_CRED_ID', defaultValue: 'Andrey-heatvm', description: 'Andrey-heatvm')
+    string(name: 'SSH_CRED_ID', defaultValue: 'kogans-ssh', description: 'kogans-ssh')
   }
 
   stages {
@@ -50,7 +50,7 @@ pipeline {
           keyFileVariable: 'SSH_KEY_FILE',
           usernameVariable: 'SSH_USER'
         )]) {
-          sh '''#!/usr/bin/env bash
+          sh '''#!/usr/bi/env bash
             set -euo pipefail
 
             chmod 600 "$SSH_KEY_FILE"

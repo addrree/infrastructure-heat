@@ -6,7 +6,7 @@ pipeline {
     string(name: 'STACK_NAME', defaultValue: 'kogan-heat', description: 'Имя Heat stack')
     string(name: 'SERVER_NAME', defaultValue: 'kogan-heat-vm', description: 'Имя VM внутри stack')
     string(name: 'NET_ID', defaultValue: '17eae9b6-2168-4a07-a0d3-66d5ad2a9f0e', description: 'UUID сети')
-    string(name: 'KEY_NAME', defaultValue: 'KoganSK', description: 'Имя keypair в OpenStack')
+    string(name: 'KEY_NAME', defaultValue: 'KoganSK2', description: 'Имя keypair в OpenStack')
     string(name: 'SECURITY_GROUP', defaultValue: 'students-general', description: 'Security group')
   }
 
